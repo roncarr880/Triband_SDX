@@ -1,10 +1,14 @@
 
 /*
- * uSDX Triband Radio
+ * uSDX Triband Radio, OLED version.
  * 
  * Main feature of this software version is interrupt driven I2C routines. We can calculate the next Si5351 transmit information while
  * the I2C bus is busy.
  * 
+ * !!!!! jumpered pin 27 to 4 and 28 to 5 to get I2C signals to the OLED.  Arduino D2, D3 should not be enabled
+ * 
+ * My process:  compile, AVRDudess, file in user/ron/local/appdata/temp/arduino_build_xxxxxx/, pickit 2 as programmer
+ * power up with pickit app to test?   !!! does pickit apply vpp when searching for a device ID?
  * 
  */
 
@@ -15,7 +19,7 @@
 // enable the fonts used
 extern unsigned char SmallFont[];
 extern unsigned char MediumNumbers[];
-extern unsigned char BigNumbers[];
+//extern unsigned char BigNumbers[];
 #define ROW0 0
 #define ROW1 8
 #define ROW2  16
@@ -29,7 +33,7 @@ extern unsigned char BigNumbers[];
 
 
 #define I2TBUFSIZE 32              // size power of 2. Size 128 can buffer a full row, max 256 as using 8 bit index
-#define I2RBUFSIZE 4               // set to expected #of reads, power of 2.  Won't be doing any reads in this program.
+#define I2RBUFSIZE 2               // set to expected #of reads, power of 2.  Won't be doing any reads in this program.
 #define I2INT_ENABLED 1            // 0 for polling in loop or timer, 1 for TWI interrupts
 
 //  I2C buffers and indexes
@@ -40,14 +44,34 @@ volatile uint8_t i2rin,i2rout;
 volatile uint8_t  gi2state;
 uint8_t i2done = 1;
 uint8_t polling;  
+uint8_t rit_enabled;
+uint32_t freq = 7074456UL;
+
+#include "si5351_usdx.cpp"     // the si5351 code from the uSDX project, modified slightly
+SI5351 si5351;
+
 
 void setup() {
 
+  i2init();
+  delay(1);
   LCD.InitLCD();
+  LCD.clrScr();
+  //i2flush();
   LCD.setFont(SmallFont);
 
-  LCD.gotoRowCol( ROW2,0 );
-  LCD.puts("Hello TriBander");
+
+   //LCD.print(F("Hello TriBander"), LEFT, ROW4); + 1400 bytes of flash ? linked print class maybe
+  LCD.gotoRowCol( 2,0 );
+  LCD.puts("TriBander SDX");
+  LCD.gotoRowCol( 4,0 );
+  LCD.puts("K1URC wb2cba pe1nnz");
+  delay(2000);                      // if the strings display correctly, the interrupts are working, else call i2flush()
+  LCD.clrScr();
+  //i2flush();
+
+  si5351.freq( freq, 0, 90, 102 );
+  display_freq();
 
 }
 
@@ -67,22 +91,40 @@ void loop() {
 }
 
 
+void display_freq(){
+int rem;
+//char priv[2];
+
+  // priv[0] = band_priv( freq );
+  // priv[1] = 0;
+   rem = freq % 1000;
+   
+    LCD.setFont(MediumNumbers);
+    LCD.printNumI(freq/1000,4*12,ROW0,5,'/');
+    LCD.setFont(SmallFont);
+    LCD.printNumI(rem,9*12,ROW1,3,'0');
+    //LCD.print( priv, RIGHT, ROW0 );
+    if( rit_enabled ){
+       LCD.clrRow( 0, 4*12, 4*12+6*4 );
+       LCD.clrRow( 1, 4*12, 4*12+6*4 );
+       LCD.print((char *)"RIT",4*12,ROW1 );      
+    }
+}
 
 // TWI interrupt version
 // if twi interrupts enabled, then need a handler
 // Stop does not produce an interrupt 
 ISR(TWI_vect){
   i2poll();
-  if( gi2state == 0 ) i2poll();   // needed to get out of state zero
-  // ++ints;
+  if( gi2state == 0 ) i2poll();   // needed to get out of state zero.  ? old idea for mult starts in buffer
 }
 
 /*****  Non-blocking  I2C  functions   ******/
 
 void i2init(){
   TWSR = 0;
-  TWBR = 12;   //8  500k, 12 400k, 72 100k   for 16 meg clock. ((F_CPU/freq)-16)/2
-               //12 500k, 17 400k, 72 125k   for 20 meg clock.  8 625k
+  TWBR = 6;    //8  500k, 12 400k, 72 100k   for 16 meg clock. ((F_CPU/freq)-16)/2
+               //12 500k, 17 400k, 72 125k   for 20 meg clock.  8 625k 6 700k
   TWDR = 0xFF;    // ?? why
   // PRR = 0;        // bit 7 should be cleared  &= 7F
   PRR &= 0x7F;
@@ -100,7 +142,6 @@ void i2start( unsigned char adr ){
 unsigned int dat;
 uint8_t t;
 
-  //Serial.print("Start1 ");  Serial.println(gi2state);
   while( i2done == 0 ){             // wait for finish of previous transfer
      noInterrupts();
      t = i2out;                     // !!! what about reads on i2c, needs work here i2rin changing if reading
@@ -112,7 +153,7 @@ uint8_t t;
   }
   dat = ( adr << 1 ) | ISTART;      // shift the address over and add the start flag
   i2send( dat );
-  //Serial.println("Start2");
+  
 }
 
 
@@ -132,15 +173,13 @@ uint8_t  t;
          t = i2out;
          interrupts();
   }
-     //Serial.print("Buf Full");  Serial.write(' ');
-     //Serial.println( ++waits ); 
+  
   i2buf[i2in++] = data;
   i2in &= (I2TBUFSIZE - 1);
 }
 
 void i2stop( ){
-   //Serial.print("Stop1 Ints Waits Extra ");  Serial.print(ints); Serial.write(' '); Serial.print(waits);
-   //Serial.write(' '); Serial.println( extra );
+
    i2send( ISTOP );   // que a stop condition
    i2done = 0;
    noInterrupts();    // kick off sending this buffer
@@ -160,6 +199,7 @@ uint8_t  ex;
   }
 }
 
+/***********    save some flash, not doing I2C reads for this radio
 // queue a read that will complete later
 void i2queue_read( unsigned char adr, unsigned char reg, unsigned char qty ){
 unsigned int dat;
@@ -192,7 +232,7 @@ uint8_t qty;
      if( qty > I2RBUFSIZE ) qty += I2RBUFSIZE;    // some funky unsigned math
      return qty;
 }
-
+*********************/
 
 
 uint8_t i2poll(){    // everything happens here.  Call this from loop. or interrupt
@@ -273,9 +313,6 @@ static uint8_t first_read;
          }
       break;    
    }
-   
-  // if( state == 3 ) digitalWrite(13,HIGH);   //!!! testing
-  // else digitalWrite(13,LOW);
    
    gi2state = state;
    if( i2in != i2out ) return (state + 8);
