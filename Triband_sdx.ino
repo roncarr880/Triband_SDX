@@ -5,21 +5,30 @@
  * Main feature of this software version is interrupt driven I2C routines. We can calculate the next Si5351 transmit information while
  * the I2C bus is busy.
  * 
- * !!!!! jumpered pin 27 to 4 and 28 to 5 to get I2C signals to the OLED.  Arduino D2, D3 should not be enabled
+ * !!! Hardware mod.  Jumpered pin 27 to 4 and 28 to 5 to get I2C signals to the OLED.  Arduino D2, D3 should not be enabled
  * 
  * My process:  compile, AVRDudess, file in user/ron/local/appdata/temp/arduino_build_xxxxxx/, pickit 2 as programmer
  * power up with pickit app to test?   !!! does pickit apply vpp when searching for a device ID?
  * 
+ * 
+ * Strip menus
+ * Select moves through menu, makes editable with encoder ( entry highlighted ), double tap select next menu, exit back to normal
+ * Strip menu area for cw decode text also.
  */
 
 #include <Arduino.h>
 #include <avr/interrupt.h>
 #include <OLED1306_Basic.h>
 
+#define ENC_A  6
+#define ENC_B  7
+#define SW_ADC A3
+
 // enable the fonts used
 extern unsigned char SmallFont[];
 extern unsigned char MediumNumbers[];
-//extern unsigned char BigNumbers[];
+extern unsigned char BigNumbers[];
+
 #define ROW0 0
 #define ROW1 8
 #define ROW2  16
@@ -27,12 +36,12 @@ extern unsigned char MediumNumbers[];
 #define ROW4  32
 #define ROW5  40
 #define ROW6  48
-#define ROW7  56
+#define ROW7  56                  // my OLED is a little low in the faceplate window, this is a good row for diag messages
 
   OLED1306 LCD;
 
 
-#define I2TBUFSIZE 32              // size power of 2. Size 128 can buffer a full row, max 256 as using 8 bit index
+#define I2TBUFSIZE 32              // size power of 2.  max 256 as using 8 bit index
 #define I2RBUFSIZE 2               // set to expected #of reads, power of 2.  Won't be doing any reads in this program.
 #define I2INT_ENABLED 1            // 0 for polling in loop or timer, 1 for TWI interrupts
 
@@ -43,9 +52,34 @@ volatile uint8_t i2in,i2out;
 volatile uint8_t i2rin,i2rout;
 volatile uint8_t  gi2state;
 uint8_t i2done = 1;
-uint8_t polling;  
+uint8_t polling;
+
 uint8_t rit_enabled;
-uint32_t freq = 7074456UL;
+uint32_t freq = 14100000UL;
+uint16_t divider = 50;            // 40 meters 100, below 7 126, 30m 70,  
+// int step_ = 100;               // trying fixed tuning steps per mode.  Maybe long press on select and exit to move 100kc
+uint8_t transmitting;
+int sw_adc;                    // request flag and result of ADC of the switches
+
+#define I2STATS                // see if the i2c interrupts are functioning and being useful in freeing up cpu time
+#ifdef I2STATS
+  uint16_t i2polls;
+  uint16_t i2ints;
+  uint16_t i2stalls;
+#endif
+
+ /* switch states */
+#define NOTACTIVE 0
+#define ARM 1
+#define DTDELAY 2
+#define FINI 3
+#define TAP  4
+#define DTAP 5
+#define LONGPRESS 6
+#define DBOUNCE 60
+
+int sw_state[3] = {NOTACTIVE,NOTACTIVE,NOTACTIVE};   /* state of the switches */
+
 
 #include "si5351_usdx.cpp"     // the si5351 code from the uSDX project, modified slightly
 SI5351 si5351;
@@ -53,30 +87,35 @@ SI5351 si5351;
 
 void setup() {
 
+  pinMode(ENC_A, INPUT_PULLUP);
+  pinMode(ENC_B, INPUT_PULLUP);
+  pinMode(SW_ADC, INPUT);
+
   i2init();
   delay(1);
   LCD.InitLCD();
   LCD.clrScr();
-  //i2flush();
   LCD.setFont(SmallFont);
 
-
-   //LCD.print(F("Hello TriBander"), LEFT, ROW4); + 1400 bytes of flash ? linked print class maybe
-  LCD.gotoRowCol( 2,0 );
-  LCD.puts("TriBander SDX");
-  LCD.gotoRowCol( 4,0 );
-  LCD.puts("K1URC wb2cba pe1nnz");
-  delay(2000);                      // if the strings display correctly, the interrupts are working, else call i2flush()
-  LCD.clrScr();
-  //i2flush();
-
-  si5351.freq( freq, 0, 90, 102 );
+  si5351.freq( freq, 0, 90, divider );
   display_freq();
+
+   // some sign on info/help screen
+  //LCD.print(F("K1URC wb2cba pe1nnz"), LEFT, ROW4);
+  //LCD.print(F("TriBander SDX"), LEFT, ROW3); // 7944 flash, 169 bytes using print from flash, diffs +1374 flash  -24 ram
+  LCD.gotoRowCol( 0,0 );                       // 6570 flash, 193 bytes using puts, diffs don't seem logical
+  LCD.puts("SDX TriBander");
+  LCD.gotoRowCol( 1,0 );
+  LCD.puts("K1URC wb2cba pe1nnz");
+
 
 }
 
 void loop() {
-  
+static unsigned long tm;
+static unsigned int sec;
+int t;
+
   if( polling ){               // may need to finish an I2C transfer if the buffer became full and we needed to poll in i2send.
      if( i2done == 0 ){
         noInterrupts();        // interrupts and twi done flags may get out of sync causing a hang condition.
@@ -86,10 +125,137 @@ void loop() {
      else polling = 0;         // looks like the interrupts finished the buffer, we can just clear the polling flag.
   }
 
-  
+  t = encoder();
+  if( t ){
+     qsy( t );
+  }
+
+  if( sw_adc == -1 ) fake_it();   
+
+  if( tm != millis()){          // 4/5 ms routines ( 20meg clock vs 16meg )
+     tm = millis();
+     button_state();
+     button_testing();     
+
+     if( ++sec == 60000 ){     // 4/5 minutes counter
+        sec = 0;
+        #ifdef I2STATS
+           uint16_t a,b,c;
+           noInterrupts();
+           a = i2ints;  b = i2polls;  c = i2stalls;
+           i2ints = i2polls = i2stalls = 0;
+           interrupts();
+           LCD.clrRow( 7 );
+           LCD.printNumI( a, LEFT, ROW7 );       // should be biggest number, interrupts working
+           LCD.printNumI( b, CENTER, ROW7 );     // some OLED functions may overfill our buffer, polling counts here
+           LCD.printNumI( c, RIGHT, ROW7 );      // polling may cause int flags out of sync with i2state, counts here
+        #endif
+     }
+  }
 
 }
 
+void fake_it(){        // !!! test code.   analog read of the switches, fake it for now
+  
+    sw_adc = analogRead( SW_ADC );
+    LCD.printNumI( sw_adc, RIGHT, ROW6 );   // readings are 772, 932, 1023 for the 3 buttons
+}
+
+char read_buttons(){                        // 3 switches on an analog pin
+int val;
+static char last;
+
+    if( digitalRead( SW_ADC ) == LOW ){     // no switch pressed
+        last = 0;
+        return 0;
+    }
+    if( sw_adc == -1 ) return last;         // no adc results yet, guess it is same as last time
+    val = sw_adc;                           // save value, queue another read
+    sw_adc = -1;
+                                            // 860 983 are usdx values
+    last = 0;                                        
+    if( val > 680 ) last = 1;               // select sw
+    if( val > 830 ) last = 2;               // 852   set lower as any sw bounce may false detect select instead of exit
+    if( val > 977 ) last = 4;               // encoder sw
+    return last;
+}
+
+
+void button_state(){                /* state machine running at 1ms rate */
+int sw,st,i;
+static int press_,nopress;
+
+      sw = read_buttons();                 // only one button detected at a time    
+      if( sw ) ++press_, nopress = 0;
+      else ++nopress, press_= 0;
+      
+      /* switch state machine */
+      for( i= 0; i < 3; ++i ){
+         st= sw_state[i];      /* temp the array value to save typing */
+
+         if( st == NOTACTIVE && (sw & 0x1) && press_ >= DBOUNCE ) st= ARM;
+         if( st == FINI && nopress >= DBOUNCE ) st = NOTACTIVE;   /* reset state */
+
+         /* double tap detect */
+         if( st == ARM && nopress >= DBOUNCE/2 )     st= DTDELAY;
+         if( st == ARM && (sw & 0x1 ) && press_ >= 10*DBOUNCE )  st= LONGPRESS; 
+         if( st == DTDELAY && nopress >= 4*DBOUNCE ) st= TAP;
+         if( st == DTDELAY && ( sw & 0x1 ) && press_ >= DBOUNCE )   st= DTAP;
+         
+         sw_state[i]= st;      
+         sw >>= 1;   /* next switch */
+      }        
+}
+
+void button_testing(){    // !!! test code
+uint8_t i;
+
+   for( i = 0; i < 3; ++i){
+      if( sw_state[i] < TAP ) continue;
+      LCD.gotoRowCol( 6,0 );
+      LCD.putch( i + 0x30 );  LCD.putch(' '); 
+      if( sw_state[i] == TAP ) LCD.puts("TAP ");
+      if( sw_state[i] == DTAP ) LCD.puts("DTAP");
+      if( sw_state[i] == LONGPRESS) LCD.puts("LONG");
+      sw_state[i] = FINI;
+   }  
+}
+
+
+int encoder(){         /* read encoder, return 1, 0, or -1 */
+// static char mod;        /* encoder is divided by 4 because it has detents */
+static char dir;        /* need same direction as last time, effective debounce */
+static char last;       /* save the previous reading */
+char new_;              /* this reading */
+char b;
+
+   if( transmitting ) return 0;
+   
+   new_ = (digitalRead(ENC_B) << 1 ) | digitalRead(ENC_A);
+   if( new_ == last ) return 0;       /* no change */
+
+   b = ( (last << 1) ^ new_ ) & 2;    /* direction 2 or 0 from xor of last shifted and new data */
+   last = new_;
+   if( b != dir ){
+      dir = b;
+      return 0;      /* require two in the same direction serves as debounce */
+   }
+  // mod = (mod + 1) & 3;       /* divide by 4 for encoder with detents */
+  // if( mod != 0 ) return 0;
+
+   return ( (dir == 2 ) ? 1: -1 );   /* swap defines ENC_A, ENC_B if it works backwards */
+}
+
+
+void qsy( int8_t f ){
+int stp;
+
+   stp = 100;      // !!! use 1000 for USB,LSB  100 for cw, 10 for RIT.  To tune ssb to odd freq will need to switch to cw, tune 
+   freq = (int32_t)freq + f * stp;
+   si5351.freq( freq, 0, 90, divider );
+   display_freq();
+   
+}
 
 void display_freq(){
 int rem;
@@ -98,7 +264,8 @@ int rem;
   // priv[0] = band_priv( freq );
   // priv[1] = 0;
    rem = freq % 1000;
-   
+
+   /****    Freq displayed on top 2 lines in yellow area of the OLED
     LCD.setFont(MediumNumbers);
     LCD.printNumI(freq/1000,4*12,ROW0,5,'/');
     LCD.setFont(SmallFont);
@@ -109,14 +276,32 @@ int rem;
        LCD.clrRow( 1, 4*12, 4*12+6*4 );
        LCD.print((char *)"RIT",4*12,ROW1 );      
     }
+    ****/
+
+    // display big numbers in the blue area of the screen
+    // font widths/height are: small 6 x 8, Medium 12 x 16, Big 14 x 24
+    LCD.setFont(BigNumbers);
+    LCD.printNumI(freq/1000,5,ROW2,5,'/');
+    LCD.setFont(MediumNumbers);
+    LCD.printNumI(rem,5*14 + 5 + 3,ROW3,3,'0');
+    LCD.setFont( SmallFont );                     // keep OLED in small text as the default font
+    if( rit_enabled ){
+       LCD.clrRow( 0, 4*12, 4*12+6*4 );       // !!!! fixup needed for this, or another way to show RIT is active
+       LCD.clrRow( 1, 4*12, 4*12+6*4 );
+       LCD.print((char *)"RIT",4*12,ROW1 );      
+    }
+
+    
 }
 
 // TWI interrupt version
-// if twi interrupts enabled, then need a handler
-// Stop does not produce an interrupt 
+// if twi interrupts enabled, then need a handler 
 ISR(TWI_vect){
   i2poll();
-  if( gi2state == 0 ) i2poll();   // needed to get out of state zero.  ? old idea for mult starts in buffer
+  if( gi2state == 0 ) i2poll();   // needed to get out of state zero.
+  #ifdef I2STATS
+     ++i2ints;
+  #endif
 }
 
 /*****  Non-blocking  I2C  functions   ******/
@@ -125,10 +310,9 @@ void i2init(){
   TWSR = 0;
   TWBR = 6;    //8  500k, 12 400k, 72 100k   for 16 meg clock. ((F_CPU/freq)-16)/2
                //12 500k, 17 400k, 72 125k   for 20 meg clock.  8 625k 6 700k
-  TWDR = 0xFF;    // ?? why
+  TWDR = 0xFF;       // ?? why
   // PRR = 0;        // bit 7 should be cleared  &= 7F
   PRR &= 0x7F;
-  //TWSR = 0;
   TWSR = 1<<TWEN;
   i2done = 1;
 }
@@ -148,7 +332,12 @@ uint8_t t;
      interrupts();
      delayMicroseconds( 40 );       // i2out should be changing if have interrupts happening 400k 
      noInterrupts();
-     if( t == i2out ) i2poll();    // kick if stuck
+     if( t == i2out ){
+        i2poll();                   // kick if stuck
+        #ifdef I2STATS
+          ++i2stalls;
+        #endif  
+     }
      interrupts();
   }
   dat = ( adr << 1 ) | ISTART;      // shift the address over and add the start flag
@@ -166,8 +355,14 @@ uint8_t  t;
   noInterrupts();
   t = i2out;
   interrupts();
-  if( t == next )  polling = 1;          // may need to finish this transfer via polling as
-  while( t == next ){                    // this transfer is bigger than our buffer.  
+  if( t == next ){
+      polling = 1;          // may need to finish this transfer via polling as tranfer is bigger than our buffer
+      #ifdef I2STATS
+        ++i2polls;
+      #endif
+  }
+  
+  while( t == next ){ 
          noInterrupts(); 
          i2poll();                  // wait for i2out to move
          t = i2out;
@@ -199,7 +394,7 @@ uint8_t  ex;
   }
 }
 
-/***********    save some flash, not doing I2C reads for this radio
+/***********    save some flash space, not doing I2C reads for this radio
 // queue a read that will complete later
 void i2queue_read( unsigned char adr, unsigned char reg, unsigned char qty ){
 unsigned int dat;
@@ -234,8 +429,9 @@ uint8_t qty;
 }
 *********************/
 
+// everything happens here.  Call this from loop or interrupt.  Only state that does not return immediately is the i2stop.
 
-uint8_t i2poll(){    // everything happens here.  Call this from loop. or interrupt
+uint8_t i2poll(){    
 static  uint8_t state = 0;
 static unsigned int data;
 static unsigned int read_qty;
@@ -264,38 +460,36 @@ static uint8_t first_read;
            else{   // just data to send
               TWDR = data;
               TWCR = (1<<TWINT) | (1<<TWEN) | (I2INT_ENABLED);
-              //delay_counter = 5;   // delay for transmit active to come true
               state = 2;
            }
         }
         else TWCR = (1<<TWEN);      // stop interrupts, keep enabled
       // break;                     // no break, check for stop completion
-      case 3:  // wait for stop to clear. TWINT does not return to high and no interrupts happen on stop.
+      case 3:  // wait here for stop to clear. TWINT does not return to high and no interrupts happen on stop.
          if( state != 3 ) break;
          while( 1 ){
             if( (TWCR & (1<<TWSTO)) == 0 ){
                state = 0;
-               i2done = 1;
+               i2done = 1;           // i2c transaction complete, buffer is free for next one
                break;
             }
          }
       break;
       
-      case 1:  // wait for start to clear, send saved data which has the device address
+      case 1:  // test for start to clear, send saved data which has the device address
          if( (TWCR & (1<<TWINT)) ){
             state = ( data & 1 ) ? 4 : 2;    // read or write pending?
             first_read = 1;
             TWDR = data;
             TWCR = (1<<TWINT) | (1<<TWEN) | (I2INT_ENABLED);
-            //delay_counter = 5;
          }
       break;
-      case 2:  // wait for done
+      case 2:  // test for done
          if( (TWCR & (1<<TWINT)) ){  
             state = 0;
          }
       break;
-      case 4:  // read until count has expired
+      case 4:  // non blocking read until count has expired
          if( (TWCR & (1<<TWINT)) ){
             // read data
             if( first_read ) first_read = 0;       // discard the 1st read, need 8 more clocks for real data
@@ -309,7 +503,6 @@ static uint8_t first_read;
                if( read_qty > 1 ) TWCR = (1<<TWINT) | (1<<TWEN) | (1<<TWEA) | (I2INT_ENABLED);  // not the last read
                else TWCR = (1<<TWINT) | (1<<TWEN) | (I2INT_ENABLED);                            // nack the last read
             }
-            //delay_counter = 5;
          }
       break;    
    }
