@@ -61,7 +61,7 @@ uint16_t divider = 50;            // 40 meters 100, below 7 126, 30m 70,
 uint8_t transmitting;
 int sw_adc;                    // request flag and result of ADC of the switches
 
-#define I2STATS                // see if the i2c interrupts are functioning and being useful in freeing up cpu time
+//#define I2STATS                // see if the i2c interrupts are functioning and being useful in freeing up cpu time
 #ifdef I2STATS
   uint16_t i2polls;
   uint16_t i2ints;
@@ -84,6 +84,11 @@ uint8_t volume =20;
 uint8_t band = 1;
 uint8_t mode = 2;
 uint8_t kspeed = 12;
+uint8_t attn = 0;
+
+#define FREQ_U 0
+#define MENU_U 1
+uint8_t encoder_user;
 
 
 #include "si5351_usdx.cpp"     // the si5351 code from the uSDX project, modified slightly
@@ -132,7 +137,8 @@ int t;
 
   t = encoder();
   if( t ){
-     qsy( t );
+     if( encoder_user == FREQ_U ) qsy( t );
+     if( encoder_user == MENU_U ) strip_menu( 3+t );    // menu commands 2 and 4
   }
 
   if( sw_adc == -1 ) fake_it();   
@@ -140,7 +146,10 @@ int t;
   if( tm != millis()){          // 4/5 ms routines ( 20meg clock vs 16meg )
      tm = millis();
      button_state();
-     button_testing();     
+     sel_button();
+     exit_button();
+     enc_button();
+     // button_testing();     
 
      if( ++sec == 60000 ){     // 4/5 minutes counter
         sec = 0;
@@ -215,6 +224,8 @@ static int press_,nopress;
       }        
 }
 
+
+/***************
 void button_testing(){    // !!! test code
 uint8_t i;
 
@@ -227,6 +238,42 @@ uint8_t i;
       if( sw_state[i] == LONGPRESS) LCD.puts("LONG");
       sw_state[i] = FINI;
    }  
+}
+********************/
+
+void sel_button(){                    // strip menu entry
+  
+  if( sw_state[0] < TAP ) return;
+  switch( sw_state[0] ){
+     case DTAP:   strip_menu( 1 );     // no break;  coded so two quick taps will enter edit mode on a var whether detected as
+     case TAP:    strip_menu( 1 );    break;      // a double tap or two single taps on the switch
+     case LONGPRESS:  freq -= 100000; qsy(0); break;
+  }
+  sw_state[0] = FINI;
+}
+
+void exit_button(){                   // strip menu exit
+  
+  if( sw_state[1] < TAP ) return;
+  switch( sw_state[1] ){
+     case DTAP:   strip_menu( 3 );     // no break;
+     case TAP:    strip_menu( 3 );    break;
+     case LONGPRESS:  freq += 100000; qsy(0); break;   // 100k freq jumps on long press sel, exit
+  }
+  sw_state[1] = FINI;
+}
+
+void enc_button(){
+  
+  if( sw_state[2] < TAP ) return;
+    switch( sw_state[2] ){
+     case DTAP:        break;
+     case TAP:         break;
+     case LONGPRESS:               // quick entry to edit volume
+        strip_menu(0); strip_menu(1); strip_menu(1);
+     break;
+  }  
+  sw_state[2] = FINI;
 }
 
 
@@ -524,39 +571,78 @@ static uint8_t first_read;
 // strcpy_P
 // simple menu with parallel arrays. Any values that do not fit in 0 to 255 will need to be scaled when used.
 // example map( var,0,255,-128,127)
-const char smenu[] PROGMEM = "Vol BandModeKSpd";
-uint8_t *svar[4] = {&volume,&band,&mode,&kspeed};
-uint8_t  smax[4] = {  255,   2,     2,     25 } ;
+#define NUM_MENU 5
+const char smenu[] PROGMEM = "Vol AttnBandModeKSpd            ";      // pad out to multiple of 4 fields
+uint8_t *svar[NUM_MENU] = {&volume,&attn,&band,&mode,&kspeed};
+uint8_t  smax[NUM_MENU] = {  255,   3,    2,     2,     25 } ;
 
-void strip_menu( int8_t command ){
+// 2,4 encoder, 0 reset entry, 1 select, 3 exit
+void strip_menu( int8_t command ){        
+static uint8_t sel;
+static uint8_t ed;
+static uint8_t mode;   // 0 not active, 1 select var, 2 edit var
 
-   LCD.clrRow(0);  LCD.clrRow(1);
-   strip_display(0);   
+   if( command == 0 ) mode = sel = ed = 0;    // menu reset.  Maybe make this open volume for edit ?
+   switch( mode ){
+       case 0:
+          LCD.clrRow(0);  LCD.clrRow(1);      // entry condition, clear area
+       break;
+       case 1:                                // changing selected var to edit
+          if( command == 2 && sel != 0 ) --sel;
+          if( command == 4 && sel < NUM_MENU-1 ) ++sel;
+       break;
+       case 2:                                // editing *svar[sel]
+          if( command == 2 && *svar[sel] != 0 ) --*svar[sel];
+          if( command == 4 && *svar[sel] < smax[sel] ) ++*svar[sel];
+       break;
+   }
+
+   // commands common to all modes
+   if( command == 1 && mode < 2 ) ++mode;
+   if( command == 3 && mode != 0 ) --mode;
+   ed = ( mode == 2 ) ? 1 : 0;
+
+   if( mode ){
+       strip_display(sel>>2, sel, ed );    // menu active
+       encoder_user == MENU_U;
+   }
+   else{
+       strip_display( sel>>2, 0xff, 0 );   // display menu with no inverse text
+       encoder_user == FREQ_U;             // encoder now changes frequency
+   }
   
 }
 
 // print 4 strings and values from somewhere in the strip menu text, offset will be a page number or group of 4
 const char mode_str[] PROGMEM = "CW USBLSB";
-void strip_display( int8_t offset ){
+void strip_display( uint8_t offset, uint8_t sel, uint8_t ed ){
 int i,k;
 uint8_t val;
 
    LCD.gotoRowCol( 0, 0 );
    for( i = 0; i < 4; ++i ){
-       for(k = 0; k < 4; ++k ) LCD.putch( pgm_read_byte( &smenu[4*i+k+offset]));     //? 16*offset
+       for(k = 0; k < 4; ++k ){
+          if( sel == ( 4*offset + i ) ) LCD.invertText(1);
+          else LCD.invertText(0);
+          LCD.putch( pgm_read_byte( &smenu[4*i+k+16*offset]));     //? 16*offset
+       }      
        LCD.putch(' ');
    }
 
    // LCD.clrRow( 1 );
    for( i = 0; i < 4; ++i ){
-       val = *svar[i];                    // !!! offset for 2nd page 4 * offset
+       val = *svar[i+4*offset];                  // offset for 2nd page 4 * offset
+       if( ed && sel == ( 4*offset + i ) ) LCD.invertText(1);
+       else LCD.invertText(0);
        // special cases
-       if( i == 1 && offset == 0 ) val += 1;     // band display, 0,1,2 becomes band 1 2 and 3 
-       if( i == 2 && offset == 0 ){              // text for mode
+       if( i == 2 && offset == 0 ) val += 1;     // band display, 0,1,2 becomes band 1 2 and 3 
+       if( i == 3 && offset == 0 ){              // text for mode
           LCD.gotoRowCol(1,i*6*5);
           for( k = 0; k < 3; ++k )LCD.putch( pgm_read_byte( &mode_str[3*mode+k] ));
        }
        else LCD.printNumI( val, i*6*5, ROW1,3,' ' );
    }
+
+   LCD.invertText(0);
   
 }
