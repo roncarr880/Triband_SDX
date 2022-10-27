@@ -78,7 +78,12 @@ int sw_adc;                    // request flag and result of ADC of the switches
 #define LONGPRESS 6
 #define DBOUNCE 60
 
-int sw_state[3] = {NOTACTIVE,NOTACTIVE,NOTACTIVE};   /* state of the switches */
+int sw_state[3] = {NOTACTIVE,NOTACTIVE,NOTACTIVE};   // state of the switches 
+
+uint8_t volume =20;
+uint8_t band = 1;
+uint8_t mode = 2;
+uint8_t kspeed = 12;
 
 
 #include "si5351_usdx.cpp"     // the si5351 code from the uSDX project, modified slightly
@@ -155,6 +160,9 @@ int t;
 
 }
 
+
+
+
 void fake_it(){        // !!! test code.   analog read of the switches, fake it for now
   
     sw_adc = analogRead( SW_ADC );
@@ -214,7 +222,7 @@ uint8_t i;
       if( sw_state[i] < TAP ) continue;
       LCD.gotoRowCol( 6,0 );
       LCD.putch( i + 0x30 );  LCD.putch(' '); 
-      if( sw_state[i] == TAP ) LCD.puts("TAP ");
+      if( sw_state[i] == TAP ) LCD.puts("TAP "), strip_menu(0);
       if( sw_state[i] == DTAP ) LCD.puts("DTAP");
       if( sw_state[i] == LONGPRESS) LCD.puts("LONG");
       sw_state[i] = FINI;
@@ -510,4 +518,45 @@ static uint8_t first_read;
    gi2state = state;
    if( i2in != i2out ) return (state + 8);
    else return state;
+}
+
+
+// strcpy_P
+// simple menu with parallel arrays. Any values that do not fit in 0 to 255 will need to be scaled when used.
+// example map( var,0,255,-128,127)
+const char smenu[] PROGMEM = "Vol BandModeKSpd";
+uint8_t *svar[4] = {&volume,&band,&mode,&kspeed};
+uint8_t  smax[4] = {  255,   2,     2,     25 } ;
+
+void strip_menu( int8_t command ){
+
+   LCD.clrRow(0);  LCD.clrRow(1);
+   strip_display(0);   
+  
+}
+
+// print 4 strings and values from somewhere in the strip menu text, offset will be a page number or group of 4
+const char mode_str[] PROGMEM = "CW USBLSB";
+void strip_display( int8_t offset ){
+int i,k;
+uint8_t val;
+
+   LCD.gotoRowCol( 0, 0 );
+   for( i = 0; i < 4; ++i ){
+       for(k = 0; k < 4; ++k ) LCD.putch( pgm_read_byte( &smenu[4*i+k+offset]));     //? 16*offset
+       LCD.putch(' ');
+   }
+
+   // LCD.clrRow( 1 );
+   for( i = 0; i < 4; ++i ){
+       val = *svar[i];                    // !!! offset for 2nd page 4 * offset
+       // special cases
+       if( i == 1 && offset == 0 ) val += 1;     // band display, 0,1,2 becomes band 1 2 and 3 
+       if( i == 2 && offset == 0 ){              // text for mode
+          LCD.gotoRowCol(1,i*6*5);
+          for( k = 0; k < 3; ++k )LCD.putch( pgm_read_byte( &mode_str[3*mode+k] ));
+       }
+       else LCD.printNumI( val, i*6*5, ROW1,3,' ' );
+   }
+  
 }
