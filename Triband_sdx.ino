@@ -10,10 +10,15 @@
  * My process:  compile, AVRDudess, file in user/ron/local/appdata/temp/arduino_build_xxxxxx/, pickit 2 as programmer
  * power up with pickit app to test?   !!! does pickit apply vpp when searching for a device ID?
  * 
- * 
- * Strip menus
- * Select moves through menu, makes editable with encoder ( entry highlighted ), double tap select next menu, exit back to normal
- * Strip menu area for cw decode text also.
+ * Button Functions,  buttons respond to TAP, Double TAP, and Long Press
+ *   Select: Tap opens menu, another Tap enables edit , DTap opens menu in edit mode, Long Press qsy's -100kc
+ *   Exit  : Tap backs out of menu one step, DTap backs out all the way, Long Press qsy's +100kc
+ *   Encoder: Long Press opens Volume directly for edit.
+ *            Tap changes tuning step 
+ *            Dtap
+ *            Any press to enable TX after band change, CHECK the switches first!
+ *            Any press to turn off RIT
+ *   
  */
 
 #include <Arduino.h>
@@ -40,6 +45,9 @@ extern unsigned char BigNumbers[];
 
   OLED1306 LCD;
 
+#define CW  0
+#define USB 1
+#define LSB 2  
 
 #define I2TBUFSIZE 32              // size power of 2.  max 256 as using 8 bit index
 #define I2RBUFSIZE 2               // set to expected #of reads, power of 2.  Won't be doing any reads in this program.
@@ -61,7 +69,7 @@ uint16_t divider = 50;            // 40 meters 100, below 7 126, 30m 70,
 uint8_t transmitting;
 int sw_adc;                    // request flag and result of ADC of the switches
 
-//#define I2STATS                // see if the i2c interrupts are functioning and being useful in freeing up cpu time
+#define I2STATS                // see if the i2c interrupts are functioning and being useful in freeing up cpu time
 #ifdef I2STATS
   uint16_t i2polls;
   uint16_t i2ints;
@@ -80,15 +88,25 @@ int sw_adc;                    // request flag and result of ADC of the switches
 
 int sw_state[3] = {NOTACTIVE,NOTACTIVE,NOTACTIVE};   // state of the switches 
 
-uint8_t volume =20;
-uint8_t band = 1;
-uint8_t mode = 2;
-uint8_t kspeed = 12;
+//   variables in the strip menu
+uint8_t volume = 20;
 uint8_t attn = 0;
+uint8_t band = 1;
+uint8_t mode = 1;
+uint8_t kspeed = 12;
+uint8_t kmode = 1;
+uint8_t vox;
+uint8_t dv;              // dummy var placeholder
+uint8_t cal = 128;       // final frequency calibration +-500hz
+uint8_t Pmin = 0;
+uint8_t Pmax = 50;
+
 
 #define FREQ_U 0
 #define MENU_U 1
 uint8_t encoder_user;
+int    step_ = 100;
+int8_t tx_inhibit = 1;         // start with a band switches check before transmit
 
 
 #include "si5351_usdx.cpp"     // the si5351 code from the uSDX project, modified slightly
@@ -118,6 +136,7 @@ void setup() {
   LCD.gotoRowCol( 1,0 );
   LCD.puts("K1URC wb2cba pe1nnz");
 
+  strip_post( 2 );                             // display band switch check message
 
 }
 
@@ -135,34 +154,25 @@ int t;
      else polling = 0;         // looks like the interrupts finished the buffer, we can just clear the polling flag.
   }
 
-  t = encoder();
+  t = encoder();               // returns -1,0,1
   if( t ){
      if( encoder_user == FREQ_U ) qsy( t );
      if( encoder_user == MENU_U ) strip_menu( 3+t );    // menu commands 2 and 4
   }
 
-  if( sw_adc == -1 ) fake_it();   
+  if( sw_adc == -1 ) fake_it();      // !!! debug
 
-  if( tm != millis()){          // 4/5 ms routines ( 20meg clock vs 16meg )
+  if( tm != millis()){          // 1 ms routines ( a quick 1ms - 20meg clock vs 16meg )
      tm = millis();
      button_state();
      sel_button();
      exit_button();
-     enc_button();
-     // button_testing();     
+     enc_button();     
 
-     if( ++sec == 60000 ){     // 4/5 minutes counter
+     if( ++sec == 60000 ){
         sec = 0;
         #ifdef I2STATS
-           uint16_t a,b,c;
-           noInterrupts();
-           a = i2ints;  b = i2polls;  c = i2stalls;
-           i2ints = i2polls = i2stalls = 0;
-           interrupts();
-           LCD.clrRow( 7 );
-           LCD.printNumI( a, LEFT, ROW7 );       // should be biggest number, interrupts working
-           LCD.printNumI( b, CENTER, ROW7 );     // some OLED functions may overfill our buffer, polling counts here
-           LCD.printNumI( c, RIGHT, ROW7 );      // polling may cause int flags out of sync with i2state, counts here
+          print_i2stats();
         #endif
      }
   }
@@ -175,7 +185,7 @@ int t;
 void fake_it(){        // !!! test code.   analog read of the switches, fake it for now
   
     sw_adc = analogRead( SW_ADC );
-    LCD.printNumI( sw_adc, RIGHT, ROW6 );   // readings are 772, 932, 1023 for the 3 buttons
+    //LCD.printNumI( sw_adc, RIGHT, ROW6 );   // readings are 772, 932, 1023 for the 3 buttons
 }
 
 char read_buttons(){                        // 3 switches on an analog pin
@@ -225,22 +235,6 @@ static int press_,nopress;
 }
 
 
-/***************
-void button_testing(){    // !!! test code
-uint8_t i;
-
-   for( i = 0; i < 3; ++i){
-      if( sw_state[i] < TAP ) continue;
-      LCD.gotoRowCol( 6,0 );
-      LCD.putch( i + 0x30 );  LCD.putch(' '); 
-      if( sw_state[i] == TAP ) LCD.puts("TAP "), strip_menu(0);
-      if( sw_state[i] == DTAP ) LCD.puts("DTAP");
-      if( sw_state[i] == LONGPRESS) LCD.puts("LONG");
-      sw_state[i] = FINI;
-   }  
-}
-********************/
-
 void sel_button(){                    // strip menu entry
   
   if( sw_state[0] < TAP ) return;
@@ -266,13 +260,25 @@ void exit_button(){                   // strip menu exit
 void enc_button(){
   
   if( sw_state[2] < TAP ) return;
-    switch( sw_state[2] ){
-     case DTAP:        break;
-     case TAP:         break;
-     case LONGPRESS:               // quick entry to edit volume
-        strip_menu(0); strip_menu(1); strip_menu(1);
-     break;
-  }  
+
+    if( tx_inhibit ){                               // any encoder press to enable transmit after band change
+        tx_inhibit = 0;
+        LCD.clrRow(6);                              // clear help message                    
+    }
+    else if( rit_enabled ){                         // any encoder press to cancel RIT
+       rit_enabled = 0;                             // returns to rx freq as we don't save the tx freq, just in si5351 registers
+       freq = freq - freq % step_;                  // clear out LSDigits
+       qsy(0);
+    }
+    else{
+       switch( sw_state[2] ){
+        case DTAP:        break;
+        case TAP:  step_ = ( step_ == 100 ) ? 1000 : 100;      break;    // toggle tuning step size
+        case LONGPRESS:               // quick entry to edit volume
+           strip_menu(0); strip_menu(1); strip_menu(1);
+        break;
+       }
+    }  
   sw_state[2] = FINI;
 }
 
@@ -303,12 +309,12 @@ char b;
 
 
 void qsy( int8_t f ){
-int stp;
 
-   stp = 100;      // !!! use 1000 for USB,LSB  100 for cw, 10 for RIT.  To tune ssb to odd freq will need to switch to cw, tune 
-   freq = (int32_t)freq + f * stp;
-   si5351.freq( freq, 0, 90, divider );
-   display_freq();
+   if( rit_enabled ) freq = (int32_t)freq + f * 10;        // tune by 10 hz
+   else freq = (int32_t)freq + f * step_;
+   if( mode == LSB ) si5351.freq( freq, 0, 90, divider );
+   else si5351.freq( freq, 90, 0, divider );
+   if( f ) display_freq();
    
 }
 
@@ -364,7 +370,7 @@ ISR(TWI_vect){
 void i2init(){
   TWSR = 0;
   TWBR = 6;    //8  500k, 12 400k, 72 100k   for 16 meg clock. ((F_CPU/freq)-16)/2
-               //12 500k, 17 400k, 72 125k   for 20 meg clock.  8 625k 6 700k
+               //12 500k, 17 400k, 72 125k   for 20 meg clock.  8 625k 6 700k  ( 4 seems to work ok 833333 )
   TWDR = 0xFF;       // ?? why
   // PRR = 0;        // bit 7 should be cleared  &= 7F
   PRR &= 0x7F;
@@ -566,15 +572,15 @@ static uint8_t first_read;
    if( i2in != i2out ) return (state + 8);
    else return state;
 }
+/*********** end I2C functions  ************/
 
 
-// strcpy_P
 // simple menu with parallel arrays. Any values that do not fit in 0 to 255 will need to be scaled when used.
 // example map( var,0,255,-128,127)
-#define NUM_MENU 5
-const char smenu[] PROGMEM = "Vol AttnBandModeKSpd            ";      // pad out to multiple of 4 fields
-uint8_t *svar[NUM_MENU] = {&volume,&attn,&band,&mode,&kspeed};
-uint8_t  smax[NUM_MENU] = {  255,   3,    2,     2,     25 } ;
+#define NUM_MENU 11
+const char smenu[] PROGMEM = "Vol AttnBandModeKSpdKmdeVox     Cal PminPmax    ";      // pad out to multiple of 4 fields
+uint8_t *svar[NUM_MENU] = {&volume,&attn,&band,&mode,&kspeed,&kmode,&vox,&dv,&cal,&Pmin,&Pmax};
+uint8_t  smax[NUM_MENU] = {  255,   3,    2,     2,     25,    3,    1,   10, 255, 50,   255 };
 
 // 2,4 encoder, 0 reset entry, 1 select, 3 exit
 void strip_menu( int8_t command ){        
@@ -582,7 +588,7 @@ static uint8_t sel;
 static uint8_t ed;
 static uint8_t mode;   // 0 not active, 1 select var, 2 edit var
 
-   if( command == 0 ) mode = sel = ed = 0;    // menu reset.  Maybe make this open volume for edit ?
+   if( command == 0 ) mode = sel = ed = 0;    // menu reset
    switch( mode ){
        case 0:
           LCD.clrRow(0);  LCD.clrRow(1);      // entry condition, clear area
@@ -604,12 +610,14 @@ static uint8_t mode;   // 0 not active, 1 select var, 2 edit var
 
    if( mode ){
        strip_display(sel>>2, sel, ed );    // menu active
-       encoder_user == MENU_U;
+       encoder_user = MENU_U;
    }
    else{
        strip_display( sel>>2, 0xff, 0 );   // display menu with no inverse text
-       encoder_user == FREQ_U;             // encoder now changes frequency
+       encoder_user = FREQ_U;              // encoder now changes frequency
    }
+
+   if( (command == 2 || command == 4) && ed ) strip_post( sel );
   
 }
 
@@ -619,21 +627,18 @@ void strip_display( uint8_t offset, uint8_t sel, uint8_t ed ){
 int i,k;
 uint8_t val;
 
-   LCD.gotoRowCol( 0, 0 );
+   LCD.gotoRowCol( 0, 0 );                             // print header row
    for( i = 0; i < 4; ++i ){
-       for(k = 0; k < 4; ++k ){
-          if( sel == ( 4*offset + i ) ) LCD.invertText(1);
-          else LCD.invertText(0);
-          LCD.putch( pgm_read_byte( &smenu[4*i+k+16*offset]));     //? 16*offset
-       }      
+       if( sel == ( 4*offset + i ) ) LCD.invertText(1);
+       for(k = 0; k < 4; ++k ) LCD.putch( pgm_read_byte( &smenu[4*i+k+16*offset]));
+       LCD.invertText(0);
        LCD.putch(' ');
    }
 
-   // LCD.clrRow( 1 );
-   for( i = 0; i < 4; ++i ){
-       val = *svar[i+4*offset];                  // offset for 2nd page 4 * offset
+   for( i = 0; i < 4; ++i ){                         // print data row
+       if( ( i+4*offset ) >= NUM_MENU ) val = 0;     // unused variable placeholder to show as zero's
+       else val = *svar[i+4*offset];                 // offset for 2nd page 4 * offset
        if( ed && sel == ( 4*offset + i ) ) LCD.invertText(1);
-       else LCD.invertText(0);
        // special cases
        if( i == 2 && offset == 0 ) val += 1;     // band display, 0,1,2 becomes band 1 2 and 3 
        if( i == 3 && offset == 0 ){              // text for mode
@@ -641,8 +646,62 @@ uint8_t val;
           for( k = 0; k < 3; ++k )LCD.putch( pgm_read_byte( &mode_str[3*mode+k] ));
        }
        else LCD.printNumI( val, i*6*5, ROW1,3,' ' );
+       LCD.invertText(0);
    }
-
-   LCD.invertText(0);
   
 }
+
+const char msg1[] PROGMEM = "Check Band Switches";
+void strip_post( uint8_t sel ){    // do any post processing needed
+int i;
+
+   LCD.clrRow( 6 );                // help message area
+   // LCD.gotoRowCol( 6,0 );       // having this here with no writes to follow seems to cause a program hang
+                                   // OLED left in command mode ?  goto is one of my "enhancements" to the library.
+   
+   switch( (int)sel ){
+      case 2:                      // band change
+                  // !!! need a band stack for the band change
+        LCD.gotoRowCol( 6,0 );           
+        for( i = 0; i < 19; ++i ) LCD.putch( pgm_read_byte( &msg1[i] ) );
+        tx_inhibit = 1;
+      //break;
+      case 3: rit_enabled = 0;  qsy(0);  break;    // clear RIT or Si5351 will not be reset to new dividers
+      case 8:  qsy(0);  break;    // cal  !!! will want to queue eeprom write
+   }
+  
+}
+
+
+
+
+/***************  temp code that may be useful again for debugging  ***************/
+#ifdef I2STATS
+ void print_i2stats(){
+           uint16_t a,b,c;
+           noInterrupts();
+           a = i2ints;  b = i2polls;  c = i2stalls;
+           i2ints = i2polls = i2stalls = 0;
+           interrupts();
+           LCD.clrRow( 7 );
+           LCD.printNumI( a, LEFT, ROW7 );       // should be biggest number, interrupts working
+           LCD.printNumI( b, CENTER, ROW7 );     // some OLED functions may overfill our buffer, polling counts here
+           LCD.printNumI( c, RIGHT, ROW7 );      // polling may cause int flags out of sync with i2state, counts here
+ }
+#endif
+
+/***************
+void button_testing(){    // !!! test code
+uint8_t i;
+
+   for( i = 0; i < 3; ++i){
+      if( sw_state[i] < TAP ) continue;
+      LCD.gotoRowCol( 6,0 );
+      LCD.putch( i + 0x30 );  LCD.putch(' '); 
+      if( sw_state[i] == TAP ) LCD.puts("TAP "), strip_menu(0);
+      if( sw_state[i] == DTAP ) LCD.puts("DTAP");
+      if( sw_state[i] == LONGPRESS) LCD.puts("LONG");
+      sw_state[i] = FINI;
+   }  
+}
+********************/
