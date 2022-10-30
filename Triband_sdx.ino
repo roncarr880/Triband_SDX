@@ -5,10 +5,19 @@
  * Main feature of this software version is interrupt driven I2C routines. We can calculate the next Si5351 transmit information while
  * the I2C bus is busy.
  * 
- * !!! Hardware mod.  Jumpered pin 27 to 4 and 28 to 5 to get I2C signals to the OLED.  Arduino D2, D3 should not be enabled
+ * !!! Hardware mod.  The Si5351 module was NOT converted to run 3.3 volts I2C signals. 
+ *     Jumpered pin 27 to 4 and 28 to 5 to get I2C signals to the OLED.  Arduino D2, D3 should not be enabled
+ *     I am running 5 volt I2C signals.
+ *     
+ *     !!! Do not use jumpers if your Si5351 is running with 3.3 volt I2C, Si5351 soldered to the board or Modified module.  
+ *     Add level converters instead for SDA, SCL, 3.3 side is Mega328, 5 volt side is OLED. 
+ *     pin 27 to level converter to pin 4, pin 28 to level converter to pin 5 
+ *     the Mega will now run 3.3 volt I2C, the OLED will be at 5 volt, the Si5351 stays at 3.3 volt
+ *     This is an untested idea.  The OLED may need a slower baud clock with the extra level converters.
  * 
  * My process:  compile, AVRDudess, file in user/ron/local/appdata/temp/arduino_build_xxxxxx/, pickit 2 as programmer
- * power up with pickit app to test?   !!! does pickit apply vpp when searching for a device ID?
+ * power up with pickit app to test?  does pickit app apply vpp when searching for a device ID?  
+ * !!! Yes so don't do this.
  * 
  * Button Functions,  buttons respond to TAP, Double TAP, and Long Press
  *   Select: Tap opens menu, another Tap enables edit , DTap opens menu in edit mode, Long Press qsy's -100kc
@@ -24,10 +33,15 @@
 #include <Arduino.h>
 #include <avr/interrupt.h>
 #include <OLED1306_Basic.h>
+#include "sine_cosine.h"
 
 #define ENC_A  6
 #define ENC_B  7
 #define SW_ADC A3
+#define AUDIO_PIN 9             // PWM pins
+#define TXMOD_PIN 10
+#define AUDIO  0b10000000      // TCCR1A values
+#define TXMOD  0b00100000
 
 // enable the fonts used
 extern unsigned char SmallFont[];
@@ -65,7 +79,6 @@ uint8_t polling;
 uint8_t rit_enabled;
 uint32_t freq = 14100000UL;
 uint16_t divider = 50;            // 40 meters 100, below 7 126, 30m 70,  
-// int step_ = 100;               // trying fixed tuning steps per mode.  Maybe long press on select and exit to move 100kc
 uint8_t transmitting;
 int sw_adc;                    // request flag and result of ADC of the switches
 
@@ -95,12 +108,12 @@ uint8_t band = 1;
 uint8_t mode = 1;
 uint8_t kspeed = 12;
 uint8_t kmode = 1;
+uint8_t side_vol = 82;
 uint8_t vox;
-uint8_t dv;              // dummy var placeholder
 uint8_t cal = 128;       // final frequency calibration +-500hz
 uint8_t Pmin = 0;
 uint8_t Pmax = 50;
-
+uint8_t dv;              // dummy var placeholder
 
 #define FREQ_U 0
 #define MENU_U 1
@@ -109,7 +122,7 @@ int    step_ = 100;
 int8_t tx_inhibit = 1;         // start with a band switches check before transmit
 
 
-#include "si5351_usdx.cpp"     // the si5351 code from the uSDX project, modified slightly
+#include "si5351_usdx.cpp"     // the si5351 code from the uSDX project, modified slightly for calibrate and RIT
 SI5351 si5351;
 
 
@@ -118,26 +131,54 @@ void setup() {
   pinMode(ENC_A, INPUT_PULLUP);
   pinMode(ENC_B, INPUT_PULLUP);
   pinMode(SW_ADC, INPUT);
+  pinMode(TXMOD_PIN, OUTPUT );             // AUDIO_PIN set in set_timer1();
+  digitalWrite(TXMOD_PIN, LOW );           // ? vaguely remember something about leaving this high for better cw shaping
 
   i2init();
-  delay(1);
   LCD.InitLCD();
   LCD.clrScr();
   LCD.setFont(SmallFont);
 
-  si5351.freq( freq, 0, 90, divider );
+  si5351.freq( freq, 0, 90, divider );     // !!! qsy0) instead of this ?
   display_freq();
 
-   // some sign on info/help screen
-  //LCD.print(F("K1URC wb2cba pe1nnz"), LEFT, ROW4);
-  //LCD.print(F("TriBander SDX"), LEFT, ROW3); // 7944 flash, 169 bytes using print from flash, diffs +1374 flash  -24 ram
-  LCD.gotoRowCol( 0,0 );                       // 6570 flash, 193 bytes using puts, diffs don't seem logical
-  LCD.puts("SDX TriBander");
-  LCD.gotoRowCol( 1,0 );
-  LCD.puts("K1URC wb2cba pe1nnz");
+  sign_on_msg();
 
   strip_post( 2 );                             // display band switch check message
+  set_timer1( AUDIO );                         // enable pwm audio out
+  //analogRead( SW_ADC );                        // enable the ADC the easy way
+  // PRR &= ~( 1 << PRADC );                      // this might be all that is needed to enable the ADC
+                                                // !!! will want a complete ADC setup I think
 
+}
+
+const char msg3[] PROGMEM = "SDX TriBander";
+const char msg4[] PROGMEM = "K1URC wb2cba pe1nnz";
+void sign_on_msg(){
+int i;
+char c;
+
+   // using the string flash helper with print( F("Sign on message")) adds 1600 bytes to flash used.
+   LCD.gotoRowCol( 0,0 );
+   i = 0;
+   while( (c = pgm_read_byte( &msg3[i++] ))) LCD.putch(c);
+  // LCD.gotoRowCol( 1,0 );
+  // i = 0;
+  // while( (c = pgm_read_byte( &msg4[i++] ))) LCD.putch(c);
+  // p_msg( msg3,0 );
+   p_msg( msg4,1 );
+  
+}
+
+// would something like this work, pointers to progmem
+void p_msg( const char *ptr, int row ){
+char c;
+
+   LCD.clrRow( row );
+   LCD.gotoRowCol( row, 0 );
+   while( ( c = pgm_read_byte(ptr++) ) ) LCD.putch(c);
+   LCD.putch(' ');                      // make sure at least one write after gotoRowCol
+  
 }
 
 void loop() {
@@ -160,7 +201,9 @@ int t;
      if( encoder_user == MENU_U ) strip_menu( 3+t );    // menu commands 2 and 4
   }
 
-  if( sw_adc == -1 ) fake_it();      // !!! debug
+  if( sw_adc == -1 ) fake_it();      // !!! debug  Analog read of switches requested.  Remove this, done elsewhere when enabled.
+
+  if( transmitting && mode == CW ) sidetone();
 
   if( tm != millis()){          // 1 ms routines ( a quick 1ms - 20meg clock vs 16meg )
      tm = millis();
@@ -178,8 +221,6 @@ int t;
   }
 
 }
-
-
 
 
 void fake_it(){        // !!! test code.   analog read of the switches, fake it for now
@@ -272,9 +313,9 @@ void enc_button(){
     }
     else{
        switch( sw_state[2] ){
-        case DTAP:        break;
-        case TAP:  step_ = ( step_ == 100 ) ? 1000 : 100;      break;    // toggle tuning step size
-        case LONGPRESS:               // quick entry to edit volume
+        case DTAP:        break;                                     // !!! unused function available
+        case TAP:  step_ = ( step_ == 100 ) ? 1000 : 100;  break;    // toggle tuning step size
+        case LONGPRESS:                                              // quick entry to edit volume
            strip_menu(0); strip_menu(1); strip_menu(1);
         break;
        }
@@ -318,6 +359,7 @@ void qsy( int8_t f ){
    
 }
 
+const char msg2[] PROGMEM = "RIT Enabled";
 void display_freq(){
 int rem;
 //char priv[2];
@@ -325,19 +367,6 @@ int rem;
   // priv[0] = band_priv( freq );
   // priv[1] = 0;
    rem = freq % 1000;
-
-   /****    Freq displayed on top 2 lines in yellow area of the OLED
-    LCD.setFont(MediumNumbers);
-    LCD.printNumI(freq/1000,4*12,ROW0,5,'/');
-    LCD.setFont(SmallFont);
-    LCD.printNumI(rem,9*12,ROW1,3,'0');
-    //LCD.print( priv, RIGHT, ROW0 );
-    if( rit_enabled ){
-       LCD.clrRow( 0, 4*12, 4*12+6*4 );
-       LCD.clrRow( 1, 4*12, 4*12+6*4 );
-       LCD.print((char *)"RIT",4*12,ROW1 );      
-    }
-    ****/
 
     // display big numbers in the blue area of the screen
     // font widths/height are: small 6 x 8, Medium 12 x 16, Big 14 x 24
@@ -347,13 +376,14 @@ int rem;
     LCD.printNumI(rem,5*14 + 5 + 3,ROW3,3,'0');
     LCD.setFont( SmallFont );                     // keep OLED in small text as the default font
     if( rit_enabled ){
-       LCD.clrRow( 0, 4*12, 4*12+6*4 );       // !!!! fixup needed for this, or another way to show RIT is active
-       LCD.clrRow( 1, 4*12, 4*12+6*4 );
-       LCD.print((char *)"RIT",4*12,ROW1 );      
-    }
-
-    
+       LCD.clrRow( 6 );
+       LCD.gotoRowCol( 6, 0 );
+       for( rem = 0; rem < 11; ++rem )  LCD.putch( pgm_read_byte( &msg2[rem] ) );     
+    }   
 }
+
+
+/*****  Non-blocking  I2C  functions   ******/
 
 // TWI interrupt version
 // if twi interrupts enabled, then need a handler 
@@ -365,12 +395,11 @@ ISR(TWI_vect){
   #endif
 }
 
-/*****  Non-blocking  I2C  functions   ******/
 
 void i2init(){
   TWSR = 0;
   TWBR = 6;    //8  500k, 12 400k, 72 100k   for 16 meg clock. ((F_CPU/freq)-16)/2
-               //12 500k, 17 400k, 72 125k   for 20 meg clock.  8 625k 6 700k  ( 4 seems to work ok 833333 )
+               //12 500k, 17 400k, 72 125k   for 20 meg clock.  8 625k 6 700k  ( 4 seems to work ok 833k )
   TWDR = 0xFF;       // ?? why
   // PRR = 0;        // bit 7 should be cleared  &= 7F
   PRR &= 0x7F;
@@ -572,15 +601,18 @@ static uint8_t first_read;
    if( i2in != i2out ) return (state + 8);
    else return state;
 }
+
+
+
 /*********** end I2C functions  ************/
 
 
 // simple menu with parallel arrays. Any values that do not fit in 0 to 255 will need to be scaled when used.
 // example map( var,0,255,-128,127)
 #define NUM_MENU 11
-const char smenu[] PROGMEM = "Vol AttnBandModeKSpdKmdeVox     Cal PminPmax    ";      // pad out to multiple of 4 fields
-uint8_t *svar[NUM_MENU] = {&volume,&attn,&band,&mode,&kspeed,&kmode,&vox,&dv,&cal,&Pmin,&Pmax};
-uint8_t  smax[NUM_MENU] = {  255,   3,    2,     2,     25,    3,    1,   10, 255, 50,   255 };
+const char smenu[] PROGMEM = "Vol AttnBandModeKSpdKmdeSvolVox Cal PminPmax    ";      // pad spaces out to multiple of 4 fields
+uint8_t *svar[NUM_MENU] = {&volume,&attn,&band,&mode,&kspeed,&kmode,&side_vol,&vox,&cal,&Pmin,&Pmax};
+uint8_t  smax[NUM_MENU] = {  255,   3,    2,     2,     25,    3,     255,     1,   255, 50,   255 };
 
 // 2,4 encoder, 0 reset entry, 1 select, 3 exit
 void strip_menu( int8_t command ){        
@@ -655,25 +687,67 @@ const char msg1[] PROGMEM = "Check Band Switches";
 void strip_post( uint8_t sel ){    // do any post processing needed
 int i;
 
-   LCD.clrRow( 6 );                // help message area
-   // LCD.gotoRowCol( 6,0 );       // having this here with no writes to follow seems to cause a program hang
+   // LCD.clrRow( 6 );                // help message area
+   // LCD.gotoRowCol( 6,0 );       // having this here with no writes to follow causes a program hang
                                    // OLED left in command mode ?  goto is one of my "enhancements" to the library.
    
    switch( (int)sel ){
       case 2:                      // band change
                   // !!! need a band stack for the band change
+        LCD.clrRow( 6 );
         LCD.gotoRowCol( 6,0 );           
         for( i = 0; i < 19; ++i ) LCD.putch( pgm_read_byte( &msg1[i] ) );
         tx_inhibit = 1;
       //break;
-      case 3: rit_enabled = 0;  qsy(0);  break;    // clear RIT or Si5351 will not be reset to new dividers
+      case 3: rit_enabled = 0;  qsy(0);  break;    // mode change.  clear RIT or Si5351 will not be reset to new dividers
       case 8:  qsy(0);  break;    // cal  !!! will want to queue eeprom write
    }
   
 }
+/*******************  end menu *********************/
 
 
+void set_timer1( uint8_t clk ){                // timer 1 is set for 8 bit fixed mode, 78k pwm
 
+   if( clk == 0 ){                             // turn off
+       pinMode( AUDIO_PIN, INPUT_PULLUP );     // ? useful at all
+       TCCR1A = 0;
+       TCCR1B = 0;
+   }
+   else{
+
+      // no prescale, arg clk controls what clock is on, WGM13-10 = 0101 fast 8 bit mode 5  ( usdx uses mode 14 )
+      // OCR1AL controls audio,  OCR1BL controls transmit pwm.
+   PRR &= ~(1 << PRTIM1 );
+   OCR1AH = 0;                       // temp high byte register is saved for B low write also
+   OCR1AL = 128;  OCR1BL = Pmin;
+   TCCR1A = clk | 1;
+   TCCR1B = 0b00001001;
+   pinMode( AUDIO_PIN, OUTPUT );
+   }
+}
+
+void audio_out( int16_t val ){        // clip/saturate values to 8 bits
+
+   OCR1AL = constrain( val + 128, 0, 255 );
+}
+
+
+void sidetone(){                     // can we generate an ok sidetone from just loop
+static uint32_t tm;
+static uint8_t  phase;
+int16_t s;
+
+   if( micros() - tm < 416 ) return;     // 3000 hz sample time, 333 for 16 mhz but 416 for 20 mhz clock
+   
+   tm = micros();                        //  sin table is 64 entries for a full wave
+   phase =  (phase+13) & 63;             //  phase update is tone *  64 / freq_samp .   600 * 64/3000 = 12.8  
+   s = pgm_read_word( &sin_cos[phase] ); //  sin table is in q12 format
+   s >>= 5;           // divide q12 number by 32, keep numbers in range of int16 or switch to long data types
+   s *= side_vol;
+   s >>= 8;           // divide by 256, max volume
+   audio_out( s );
+}
 
 /***************  temp code that may be useful again for debugging  ***************/
 #ifdef I2STATS
@@ -705,3 +779,16 @@ uint8_t i;
    }  
 }
 ********************/
+
+   /****    Freq displayed on top 2 lines in yellow area of the OLED
+    LCD.setFont(MediumNumbers);
+    LCD.printNumI(freq/1000,4*12,ROW0,5,'/');
+    LCD.setFont(SmallFont);
+    LCD.printNumI(rem,9*12,ROW1,3,'0');
+    //LCD.print( priv, RIGHT, ROW0 );
+    if( rit_enabled ){
+       LCD.clrRow( 0, 4*12, 4*12+6*4 );
+       LCD.clrRow( 1, 4*12, 4*12+6*4 );
+       LCD.print((char *)"RIT",4*12,ROW1 );      
+    }
+    ****/
