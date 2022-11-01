@@ -1,4 +1,5 @@
 /* sine cosine table in q12 format */
+// I changed 4096 to 4095 as 4096 needs another bit to represent that value.  -4096 does not.
 
 const int sin_cos [ ] PROGMEM = { 
    // 0 . 000000q12 , 
@@ -34,7 +35,7 @@ const int sin_cos [ ] PROGMEM = {
 ,   // , 0 . 995185q12 , 
 	 4076
 ,   // , 1 . 000000q12 , 
-	 4096
+	 4095
 ,   // , 0 . 995185q12 , 
 	 4076
 ,   // , 0 . 980785q12 , 
@@ -162,7 +163,7 @@ const int sin_cos [ ] PROGMEM = {
 ,   // , 0 . 995185q12 , 
 	 4076
 ,   // , 1 . 000000q12  
-	 4096
+	 4095
 };
 
 

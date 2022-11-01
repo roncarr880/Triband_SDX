@@ -21,6 +21,7 @@ extern void i2start( unsigned char c );
 extern void i2send( unsigned int data );
 extern void i2stop( );
 extern uint8_t rit_enabled;
+extern uint8_t cal;
 //extern int saves;
 
 //  The Si5351 code
@@ -39,7 +40,7 @@ public:
   #define FAST __attribute__((optimize("Ofast")))
 
   //#define F_XTAL 27003380            // Crystal freq in Hz, nominal frequency 27004300
-  #define F_XTAL 25004000          // Alternate SI clock
+  #define F_XTAL 25000125UL          // Alternate SI clock
   //#define F_XTAL 20004000          // A shared-single 20MHz processor/pll clock
   volatile uint32_t fxtal = F_XTAL;
 
@@ -110,6 +111,8 @@ public:
   void freq(uint32_t fout, uint8_t i, uint8_t q, uint16_t d ){  // Set a CLK0,1 to fout Hz with phase i, q
       uint8_t msa; uint32_t msb, msc, msp1, msp2, msp3p2;
       uint8_t rdiv = 0;             // CLK pin sees fout/(2^rdiv)
+
+      fxtal = F_XTAL + (uint32_t)(5*((int)cal-128));
       
       //if(fout < 500000){ rdiv = 7; fout *= 128; }; // Divide by 128 for fout 4..500kHz
       //uint16_t d = (16 * fxtal) / fout;  // Integer part
