@@ -11,13 +11,13 @@
  *     
  *     !!! Do not use jumpers if your Si5351 is running with 3.3 volt I2C, Si5351 soldered to the board or Modified module.  
  *     Add level converters instead for SDA, SCL, 3.3 side is ATMega328, 5 volt side is OLED. 
- *     pin 27 to level converter to pin 4, pin 28 to level converter to pin 5 
- *     the Mega will now run 3.3 volt I2C, the OLED will be at 5 volt, the Si5351 stays at 3.3 volt
+ *     Pin 27 to level converter to pin 4.   Pin 28 to level converter to pin 5.
+ *     The Mega328 will now run 3.3 volt I2C, the OLED will be at 5 volt, the Si5351 stays at 3.3 volt
  *     This is an untested idea.  The OLED may need a slower baud clock with the extra level converters.
  * 
  * My process:  compile, AVRDudess, file in user/ron/local/appdata/temp/arduino_build_xxxxxx/, pickit 2 as programmer
  * power up with pickit app to test?  does pickit app apply vpp when searching for a device ID?  
- * !!! Yes so don't do this.
+ * !!!!!!!!!!  Yes so don't do this.
  * 
  * Button Functions,  buttons respond to TAP, Double TAP, and Long Press
  *   Select: Tap opens menu, another Tap enables edit , DTap opens menu in edit mode, Long Press qsy's -100kc
@@ -41,8 +41,10 @@
 #define SW_ADC A3
 #define AUDIO_PIN 9             // PWM pins
 #define TXMOD_PIN 10
-#define AUDIO  0b10000000      // TCCR1A values
+#define AUDIO  0b10000000       // TCCR1A values
 #define TXMOD  0b00100000
+#define RX     2                // TIMSK2 interrupt enable bits, for timer2 setup
+#define TX     4
 
 // enable the fonts used
 extern unsigned char SmallFont[];
@@ -90,7 +92,8 @@ uint32_t bandstack[3] = { 21100000UL, 14100000UL, 7100000UL };
   uint16_t i2polls;
   uint16_t i2ints;
   uint16_t i2stalls;
-  uint16_t rx_overruns;       //  Added another debug counter non-i2c related  
+  uint16_t rx_overruns;       //  Added another debug counter non-i2c related
+  uint16_t rx_underruns;  
 #endif
 
  /* switch states */
@@ -112,20 +115,24 @@ uint8_t band = 2;        // bands here are numbered 0,1,2    Display as 1,2,3   
 uint8_t mode = 1;
 uint8_t kspeed = 12;
 uint8_t kmode = 1;
-uint8_t side_vol = 82;
+uint8_t side_vol = 22;
 uint8_t vox;
 uint8_t cal = 128;       // final frequency calibration +-500hz
 uint8_t Pmin = 0;
 uint8_t Pmax = 50;
 uint8_t dv;              // dummy var menu placeholder
 
+uint8_t ad_ref;          // some bits to merge with the A/D mux bits to select the reference voltage
+
 uint8_t oldband;         // for saving freq in bandstack on band change
 
 uint16_t eeprom_write_pending;     // delay eeprom writes while the user fiddles the values
 
 // receiver vars
-volatile int rx_val, Qr, Ir;
+#define PIPE  64
+volatile int rx_val[PIPE], Qr[PIPE], Ir[PIPE];     // post processing pipeline needed
 volatile uint8_t rx_process_flag;
+volatile uint8_t rx_ready_flag;
 
 #define FREQ_U 0
 #define MENU_U 1
@@ -151,7 +158,7 @@ void setup() {
   pinMode(TXMOD_PIN, OUTPUT );
   digitalWrite(TXMOD_PIN, LOW );           // ? vaguely remember something about leaving this high for better cw shaping
   pinMode( AUDIO_PIN, OUTPUT );
-  digitalWrite( AUDIO_PIN, LOW );          // if thumps try the floating the pin as in timer1 startup
+  digitalWrite( AUDIO_PIN, LOW );          // if thumps try the floating the pin as in timer1 startup notes
 
   i2init();
   LCD.InitLCD();
@@ -167,11 +174,11 @@ void setup() {
   p_msg( msg4,1 );
   p_msg( msg1,6 );                         // display band switch check message, manual switches
   
+  analogRead( SW_ADC );                    // enable the ADC the easy way?
+  // PRR &= ~( 1 << PRADC );               // adc power reduction bit should be clear
+
   set_timer1( AUDIO );                     // enable pwm audio out
-  
-  //analogRead( SW_ADC );                        // enable the ADC the easy way
-  // PRR &= ~( 1 << PRADC );                      // this might be all that is needed to enable the ADC
-                                                // !!! will want a complete ADC setup I think
+  set_timer2( RX );                        // start receiver
 
 }
 
@@ -194,11 +201,8 @@ static unsigned int sec;
 static uint8_t robin;          // round robin some processing, not sure this is needed
 int t;
 
- // high priority.    What is my loop speed?
-  if( rx_process_flag ){
-     rx_process2();
-     return;                   // if nothing else works, we are probably interrupt bound
-  }
+ // high priority.
+  while( rx_process_flag ) rx_process2();
  
   if( polling ){               // may need to finish an I2C transfer if the buffer became full and we needed to poll in i2send.
      if( i2done == 0 ){        // a bigger buffer may help,  but screen writes send a bunch of data
@@ -215,7 +219,7 @@ int t;
      if( encoder_user == MENU_U ) strip_menu( 3+t );    // menu commands 2 and 4
   }
 
-  if( sw_adc == -1 ) fake_it();      // !!! debug  Analog read of switches requested.  Remove this, done elsewhere when enabled.
+  //if( sw_adc == -1 ) fake_it();      // !!! debug  Analog read of switches requested.  Remove this, done elsewhere when enabled.
 
   if( transmitting && mode == CW ) sidetone();
 
@@ -244,12 +248,13 @@ int t;
 
 }
 
-
+/*****
 void fake_it(){        // !!! test code.   analog read of the switches, fake it for now
   
     sw_adc = analogRead( SW_ADC );
     //LCD.printNumI( sw_adc, RIGHT, ROW6 );   // readings are 772, 932, 1023 for the 3 buttons
 }
+******/
 
 char read_buttons(){                        // 3 switches on an analog pin
 int val;
@@ -259,11 +264,12 @@ static char last;
         last = 0;
         return 0;
     }
+    last = 8;                               // get the vref up to 5 volts, invalid switch
     if( sw_adc == -1 ) return last;         // no adc results yet, guess it is same as last time
     val = sw_adc;                           // save value, queue another read
     sw_adc = -1;
-                                            // 860 983 are usdx values
-    last = 0;                                        
+                                            // 860 983 are usdx values for breakpoints in voltage read
+    // last = 0;                                        
     if( val > 680 ) last = 1;               // select sw
     if( val > 830 ) last = 2;               // 852   set lower as any sw bounce may false detect select instead of exit
     if( val > 977 ) last = 4;               // encoder sw
@@ -274,10 +280,12 @@ static char last;
 void button_state(){                /* state machine running at 1ms rate */
 int sw,st,i;
 static int press_,nopress;
+int8_t sw_true;
 
       sw = read_buttons();                 // only one button detected at a time    
-      if( sw ) ++press_, nopress = 0;
+      if( sw & 7 ) ++press_, nopress = 0;  // check only valid switch
       else ++nopress, press_= 0;
+      sw_true = sw;                        // value 8 or valid switch will make vref 5 volts
       
       /* switch state machine */
       for( i= 0; i < 3; ++i ){
@@ -292,9 +300,17 @@ static int press_,nopress;
          if( st == DTDELAY && nopress >= 4*DBOUNCE ) st= TAP;
          if( st == DTDELAY && ( sw & 0x1 ) && press_ >= DBOUNCE )   st= DTAP;
          
-         sw_state[i]= st;      
+         sw_state[i]= st;
+         sw_true |= st;                     // a switch is active or was active
          sw >>= 1;   /* next switch */
-      }        
+      }
+      // maybe a funny place to set the A/D reference voltage, but we need 5 volts when the switches are active
+      ad_ref = 0x40 | 0x80;                                // assume 1.1 volt
+      if( sw_true ) ad_ref = 0x40;                         // need 5 volt reference
+      else if( vox == 0 && ( attn & 1 ) ) ad_ref = 0x40;   // attn setting if vox inactive, vox uses 1.1 volt
+
+      //ad_ref = 0x40;    // !!!! debug, force 5 volts
+          
 }
 
 
@@ -430,10 +446,9 @@ ISR(TWI_vect){
 
 void i2init(){
   TWSR = 0;
-  TWBR = 6;    //8  500k, 12 400k, 72 100k   for 16 meg clock. ((F_CPU/freq)-16)/2
+  TWBR = 17;    //8  500k, 12 400k, 72 100k   for 16 meg clock. ((F_CPU/freq)-16)/2
                //12 500k, 17 400k, 72 125k   for 20 meg clock.  8 625k 6 700k  ( 4 seems to work ok 833k )
   TWDR = 0xFF;       // ?? why
-  // PRR = 0;        // bit 7 should be cleared  &= 7F
   PRR &= 0x7F;
   TWSR = 1<<TWEN;
   i2done = 1;
@@ -452,7 +467,8 @@ uint8_t t;
      noInterrupts();
      t = i2out;                     // !!! what about reads on i2c, needs work here i2rin changing if reading
      interrupts();
-     delayMicroseconds( 40 );       // i2out should be changing if have interrupts happening 400k 
+     if( rx_process_flag ) rx_process2();   // keep rx going rather than waste time, special case for this radio
+     else delayMicroseconds( 40 );          // i2out should be changing if have interrupts happening 400k 
      noInterrupts();
      if( t == i2out ){
         i2poll();                   // kick if stuck
@@ -464,7 +480,8 @@ uint8_t t;
   }
   dat = ( adr << 1 ) | ISTART;      // shift the address over and add the start flag
   i2send( dat );
-  
+  // !!! change baud rate here for si5351 vs OLED ?  17 or 6
+  // !!! may be better to just use the transmitting variable or both
 }
 
 
@@ -644,7 +661,7 @@ static uint8_t first_read;
 #define NUM_MENU 11
 const char smenu[] PROGMEM = "Vol AttnBandModeKSpdKmdeSvolVox Cal PminPmax    ";      // pad spaces out to multiple of 4 fields
 uint8_t *svar[NUM_MENU] = {&volume,&attn,&band,&mode,&kspeed,&kmode,&side_vol,&vox,&cal,&Pmin,&Pmax};
-uint8_t  smax[NUM_MENU] = {  255,   3,    2,     2,     25,    3,     255,     1,   255, 50,   255 };
+uint8_t  smax[NUM_MENU] = {  63,   3,    2,     2,     25,    3,     63,       1,   255, 50,   255 };
 uint32_t stripee = 0b00000000000000000000011100100000;                         // bit set for strip menu items to save in eeprom
 
 // 2,4 encoder, 0 reset entry, 1 select, 3 exit
@@ -692,6 +709,7 @@ void strip_display( uint8_t offset, uint8_t sel, uint8_t ed ){
 int i,k;
 uint8_t val;
 
+ if( ed == 0 ){                                  // skip extra OLED writes
    LCD.gotoRowCol( 0, 0 );                             // print header row
    for( i = 0; i < 4; ++i ){
        if( sel == ( 4*offset + i ) ) LCD.invertText(1);
@@ -699,14 +717,15 @@ uint8_t val;
        LCD.invertText(0);
        LCD.putch(' ');
    }
+ }  
 
    for( i = 0; i < 4; ++i ){                         // print data row
        if( ( i+4*offset ) >= NUM_MENU ) val = 0;     // unused variable placeholder to show as zero's
        else val = *svar[i+4*offset];                 // offset for 2nd page 4 * offset
        if( ed && sel == ( 4*offset + i ) ) LCD.invertText(1);
        // special cases
-       if( sel == 2 ) val += 1;     // band display, 0,1,2 becomes band 1 2 and 3 
-       if( sel == 3 ){              // text for mode
+       if( offset == 0 && i == 2 ) val += 1;     // band display, 0,1,2 becomes band 1 2 and 3 
+       if( offset == 0 && i == 3 ){              // text for mode
           LCD.gotoRowCol(1,i*6*5);
           for( k = 0; k < 3; ++k )LCD.putch( pgm_read_byte( &mode_str[3*mode+k] ));
        }
@@ -763,9 +782,11 @@ uint8_t val;
 
 /*******************  end menu *********************/
 
+/*****    Radio processing   *****/
 
-void set_timer1( uint8_t clk ){                // timer 1 is set for 8 bit fixed mode, 78k pwm
-
+void set_timer1( uint8_t clk ){                // timer 1 is set for 8 bit fixed mode 78k PWM
+                                               // enable both PWM's for CW so can hear sidetone
+   noInterrupts();
    if( clk == 0 ){                             // turn off
       // pinMode( AUDIO_PIN, INPUT_PULLUP );     // ? useful at all to float the audio pin or should we just leave it as
        TCCR1A = 0;                             // an output pin.  It would make more sense to do this if audio is muted.
@@ -777,12 +798,40 @@ void set_timer1( uint8_t clk ){                // timer 1 is set for 8 bit fixed
       // OCR1AL controls audio,  OCR1BL controls transmit pwm.
    PRR &= ~(1 << PRTIM1 );
    OCR1AH = 0;                       // temp high byte register is saved for B low write also
-   OCR1AL = 128;  OCR1BL = Pmin; TCNT1L = 0;
+   OCR1AL = 128;  OCR1BL = Pmin;  TCNT1L = 0;
    TCCR1A = clk | 1;
    TCCR1B = 0b00001001;
   // pinMode( AUDIO_PIN, OUTPUT );
    }
+   interrupts();
 }
+
+void set_timer2( int8_t mode){
+
+  noInterrupts();
+  TCCR2B = 0;                        // stop
+  TCNT2 = 0;                         // clear counter
+  PRR &= ~(1 << PRTIM2 );            // powered up
+  TCCR2A = 2;                        // CTC mode
+  TIMSK2 = mode;                     // enable interrupts A match or B match, RX TX defines
+                                     // OCR2A = (F_CPU / pre-scaler / fs) - 1;
+  OCR2A = 51;                        // count to value, resets, interrupts, fs = 47786, !!! different value for TX
+  OCR2B = OCR2A - 1;                 // use the 2nd interrupt for transmit
+  TCCR2B = 2;                        // start clocks, divide by 8 clock
+  interrupts();
+}
+
+
+ISR(TIMER2_COMPA_vect){               // Timer2 COMPA interrupt
+
+   rx_process();  
+}
+
+ISR(TIMER2_COMPB_vect){               // Timer2 COMPB interrupt, change TIMSK2 to pick what process is running
+
+   //tx_process();
+}
+
 
 void audio_out( int16_t val ){        // clip/saturate values to 8 bits
  
@@ -800,11 +849,12 @@ int16_t s;
    tm = micros();                        //  sin table is 64 entries for a full wave
    phase =  (phase+13) & 63;             //  phase update is tone *  64 / freq_samp .   600 * 64/3000 = 12.8
                                  
-   s = pgm_read_word( &sin_cos[phase] ); //  sin table is in q12 format
-   s >>= 5;           // divide q12 number by 32, keep numbers in range of int16 or switch to long data types
-                      // have -128 to 128 as sine value 
+   //s = pgm_read_word( &sin_cos[phase] ); //  sin table is in q12 format
+   //s >>= 5;           // divide q12 number by 32, keep numbers in range of int16 or switch to long data types
+                        // have -128 to 128 as sine value
+   s = pgm_read_byte( &sin_cos[phase] );   // q6 format, have -64 to 64, half volume, can shift left if want full volume
    s *= side_vol;
-   s >>= 8;           // divide by 256, max volume
+   s >>= 6;           // divide by 64, max volume
    audio_out( s );
 }
 
@@ -826,6 +876,10 @@ void rx_process(){
 static int a1,b1,c1,a2,b2,c2,d2;       // delay lines for stealing A/D samples for buttons and VOX
 static uint8_t flip;                   // processing I or Q ?
 static uint8_t missing;                // flag for stealing A/D reads
+static uint8_t adps = 4;               // self adjusting adc clock rate, should settle at slowest we can use
+                                       // start value is 7, settles on 4 for current sample rate. enable again if rate changes
+// static uint8_t lock = 10;              // lockout adjusting on each busy adc, slow the change rate
+                                       
 
 // https://www.dsprelated.com/showarticle/1337.php
 // CIC filter terms.  Integrate, decimate by 4, Comb filter ( length 4 but only need one delay )
@@ -835,17 +889,26 @@ static int8_t R;                      // decimation Rate
 static int z1,z2,z3,z4;
 static int z2d, z3d;
 
+static int8_t inrx, outrx;            // pipeline indexes
+
 
    flip ^= 1;
    if( flip ){       // process Q
-       // c1 = read val
-       // que next read for I
-       if( missing == 2 ) b1 = (a1 + c1) >> 1, missing = 0;    // calc missing value of b, linear interpolation
-       if( missing == 1 ) ;   // store where needed, ++missing.  c1 is bogus at this point.
+    
+       //if( ADCSRA & ( 1 << ADSC ) ){      // still busy, use a faster adc clock
+       //    if( lock == 0 ) --adps, lock = 5;
+       //    --lock;
+       //}
+       
+       c1 = ADC - 512;
+       ADMUX = ad_ref | 0;                // que next read for I, merge ad_ref bits
+       ADCSRA = 0xc0 + adps;              // start conversion
+       if( missing == 2 ) b1 = (a1 + c1) >> 1, missing = 0;          // calc missing value of b, linear interpolation
+       if( missing == 1 ) sw_adc = c1 + 512, missing = 2;            // c1 is bogus at this point, fixed next time.
 
        // CIC filtering
        y2 = y2 + ( y1 = y1 + a1 );        // two cascaded integrators, input is a1
-       a1 = b1; b1 = c1;                  // move the steal A/D delay line
+       a1 = b1; b1 = c1;                  // move the A/D delay line
        R = (R+1) & 3;                     // mod 4 counter
        if( R ) return;                    // decimate by 4, process on zero, skip 1 2 3
        
@@ -853,75 +916,110 @@ static int z2d, z3d;
        y3 = y2 - y2d;   y2d = y2;         // two comb filters, length is decimation rate ( 4 )
        y4 = y3 - y3d;   y3d = y3;         // but only one delay term is needed as running at 1/4 rate
 
-       y4 >>= 4;                          // shift out extra bits       
+       y4 >>= 4;                          // shift out extra bits.  Did we gain one bit with the oversampling?   
       
    }
    else{             // process I
-       // d2 = read val
-       // if sw_request == -1, que that read, missing = 1;
-       // else que next read for Q
+    
+       //if( ADCSRA & ( 1 << ADSC ) ){      // still busy, use a faster adc clock
+       //    if( lock == 0 ) --adps, lock = 5;
+       //    --lock;
+       //}
+       
+       d2 = ADC - 512;
+       if( sw_adc == -1 ) ADMUX = ad_ref | 3 , missing = 1;     // steal an ADC read
+       else ADMUX = ad_ref | 1;              // que next read for Q, merge ad_ref bits
+       ADCSRA = 0xc0 + adps;                 // start conversion
+       
        a2 = ( a2 + b2 ) >> 1;                // half sample delay
 
        // process a2
        z2 = z2 + ( z1 = z1 + a2 );           // two cascaded integrators
-       a2 = b2;  b2 = c2;  c2 = d2;          // move steal A/D delay terms, extra term for 1/2 sample delay
+       a2 = b2;  b2 = c2;  c2 = d2;          // move A/D delay terms, extra term for 1/2 sample delay
 
        // R = (R+1) & 3;                     // this was done in above code
        if( R ) return;                       // decimate by 4
 
        z3 = z2 - z2d;   z2d = z2;         // two comb filters, length is decimation rate ( 4 )
        z4 = z3 - z3d;   z3d = z3;         // but only one delay term is needed as running at 1/4 rate
-       z4 >>= 4;                          // shift out extra bits ( or digital gain? or 4 bits of AGC? )
+       z4 >>= 4;                          // shift out extra bits
 
        // have y4 and z4 , I and Q at 1/4 rate
-
-       #ifdef I2STATS
-         if( rx_process_flag ) ++rx_overruns;
-       #endif
        
        // write last PWM value and queue the calculation of the next one
-       audio_out( rx_val );
-       Qr = y4;  Ir = z4;
-       rx_process_flag = 1;
+       if( rx_ready_flag > 0 ){
+           audio_out( rx_val[outrx++] );
+           outrx &= (PIPE-1);
+           --rx_ready_flag;
+       }
+       #ifdef I2STATS
+         else ++rx_underruns;             // expect a couple starting up, then pipeline starts working
+       #endif  
+
+       if( rx_process_flag < (PIPE-1) ){
+          Qr[inrx] = y4;  Ir[inrx++] = z4;
+          inrx &= (PIPE-1);
+          ++rx_process_flag;
+       }
+       #ifdef I2STATS
+         else{
+            ++rx_overruns;              // this would be bad, pipeline is full
+            //--rx_underruns;             // an overrun may cause an underrun as data was not processed
+         }
+       #endif
+         
    }
   
 }
 
-// some non-interrupt processing,  will this work from loop()
-// calc rx_val to be sent to PWM audio on the next rx interrupt mod8 if account for interleave
+// some non-interrupt processing,  will this work from loop(), added a pipeline as it fell behind
+// calc rx_val to be sent to PWM audio on the rx interrupt 
 void rx_process2(){
 int val;
-
-   val = Ir >> 2;   // Output is 8 bits.  Qr not used, simple DC receiver.
-
-
-   // need to be at 8 bits for this calc or use long type for val
-   val *= volume;
-   val >>= 8;                 // divide by 256.  Throwing bits away.
+static uint8_t rxout, rxin;     // local indexes rather than shared, hopefully will stay in sync with interrupt processing
 
    noInterrupts();
-   rx_val = val;
-   rx_process_flag = 0;
+   val = Ir[rxout] >> 2;   // Output is 8 bits.  Qr not used, simple DC receiver.
+                    // ?? or leave this at 10 bits and possible clip 2 ( 12db ) at the output PWM
+   --rx_process_flag;
+   interrupts();
+   ++rxout;  rxout &= (PIPE-1);
+
+   // need to be at <= 10 bits for this calc or use long type for val
+   val *= volume;
+   val >>= 6;
+
+   noInterrupts();
+   rx_val[rxin++] = val;
+   ++rx_ready_flag;
+   rxin &= (PIPE-1);
    interrupts();
 }
 
-/***************  temp code that may be useful again for debugging  ***************/
+
 #ifdef I2STATS
  void print_i2stats(){
-           uint16_t a,b,c,d;
+           uint16_t a,b,c,d,e,f;
            noInterrupts();
            a = i2ints;  b = i2polls;  c = i2stalls;
            i2ints = i2polls = i2stalls = 0;
            d = rx_overruns;  rx_overruns = 0;      // added rx_process debugging to this, commented out i2stats
+           e = rx_underruns;  rx_underruns = 0;
+           f = rx_ready_flag;
            interrupts();
            LCD.clrRow( 7 );
           // LCD.printNumI( a, LEFT, ROW7 );       // should be biggest number, interrupts working
           // LCD.printNumI( b, CENTER, ROW7 );     // some OLED functions may overfill our buffer, polling counts here
           // LCD.printNumI( c, RIGHT, ROW7 );      // polling may cause int flags out of sync with i2state, counts here
-          LCD.printNumI( d, LEFT, ROW7 );          // rx_process out of CPU
+          LCD.printNumI( d, LEFT, ROW7 );          // rx_process overruns
+          //LCD.printNumI(ADCSRA & 7 , CENTER, ROW7 );    // check auto ADC baud rate value
+          LCD.printNumI( f, CENTER, ROW7 );
+          LCD.printNumI( e, RIGHT, ROW7 );
  }
 #endif
 
+
+/***************  temp code that may be useful again for debugging  ***************/
 /***************
 void button_testing(){    // !!! test code
 uint8_t i;
