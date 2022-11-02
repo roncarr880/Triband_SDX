@@ -22,7 +22,6 @@ extern void i2send( unsigned int data );
 extern void i2stop( );
 extern uint8_t rit_enabled;
 extern uint8_t cal;
-//extern int saves;
 
 //  The Si5351 code
 class SI5351 {
