@@ -4,9 +4,10 @@
  * 
  * Main features of this software version: 
  *     Interrupt driven I2C routines. We can calculate the next Si5351 transmit information while the I2C bus is busy.
- *        In theory we may achieve a higher tx sampling rate.
- *     Distributed receive processing with pipelined data flow.  Not all the receive processing needs to fit in one high
- *        speed interrupt.  
+ *        In theory we may achieve a higher tx sampling rate than otherwise.
+ *     Distributed receive processing with pipelined data flow.    
+ *        In theory we will have more time to process more complicated receive algorithms.
+ *     Good looking display layout.
  * 
  * !!! Hardware mod.  The Si5351 module was NOT converted to run 3.3 volts I2C signals. 
  *     Jumpered pin 27 to 4 and 28 to 5 to get I2C signals to the OLED.  Arduino D2, D3 should not be enabled
@@ -20,9 +21,9 @@
  *     This is an untested idea. Should work, OLED I2C baud is 125k.
  * 
  * My process:  compile, AVRDudess, file in user/ron/local/appdata/temp/arduino_build_xxxxxx/, pickit 2 as programmer
- *  power up with pickit app to test ?  
+ *  ? power up with pickit app to test ?  
  *  does pickit app apply 12v vpp when searching for a device ID?  ( it applies 5v a few times, 9 volts, then 12 volts ).
- *          !!!!!!!!!!  Yes, so don't do this.  !!!!!!!!!!!
+ *          !!!!!!!!!!  Yes, so don't power the radio with the Pickit2 App. !!!!!!!!!!!
  * 
  * Button Functions,  buttons respond to TAP, Double TAP, and Long Press
  *   Select: Tap opens menu, another Tap enables edit , DTap opens menu in edit mode, Long Press qsy's -100kc
@@ -30,7 +31,7 @@
  *   Encoder: Long Press opens Volume directly for edit.
  *            Tap changes tuning step 
  *            Dtap  ( unassigned )
- *            Any press to enable TX after band change, CHECK the switches first!
+ *            Any press to enable TX after band change, CHECK the switches first!, clears message on screen.
  *            Any press to turn off RIT
  *   
  */
@@ -81,7 +82,7 @@ unsigned int i2buf[I2TBUFSIZE];   // writes
 uint8_t i2rbuf[I2RBUFSIZE];       // reads
 volatile uint8_t i2in,i2out;
 volatile uint8_t i2rin,i2rout;
-volatile uint8_t  gi2state;
+//volatile uint8_t  gi2state;
 uint8_t i2done = 1;
 uint8_t polling;
 
@@ -435,7 +436,7 @@ int rem;
 // if twi interrupts enabled, then need a handler 
 ISR(TWI_vect){
   i2poll();
-  if( gi2state == 0 ) i2poll();   // needed to get out of state zero.
+  //if( gi2state == 0 ) i2poll();   // needed to get out of state zero. Fixed this issue I think.
   #ifdef I2STATS
      ++i2ints;
   #endif
@@ -584,8 +585,99 @@ uint8_t qty;
 }
 *********************/
 
-// everything happens here.  Call this from loop or interrupt.  Only state that does not return immediately is the i2stop.
+// everything happens here.  Call this from loop or interrupt.
+// Only state that does not return immediately is the i2stop.  It does not produce an interrupt.
+// modified to take some of the cases out of the switch construct so they always get parsed.
+// Fixes the need to double poll when in state 0. 
 
+uint8_t i2poll(){    
+static  uint8_t state = 0;
+static unsigned int data;
+static unsigned int read_qty;
+static uint8_t first_read;
+
+   
+   switch( state ){
+           
+      case 1:  // test for start to clear, send saved data which has the device address
+         if( (TWCR & (1<<TWINT)) ){
+            state = ( data & 1 ) ? 4 : 2;    // read or write pending?
+            first_read = 1;
+            TWDR = data;
+            TWCR = (1<<TWINT) | (1<<TWEN) | (I2INT_ENABLED);
+         }
+      break;
+      case 2:  // test for done
+         if( (TWCR & (1<<TWINT)) ){  
+            state = 0;
+         }
+      break;
+      case 4:  // non blocking read until count has expired
+         if( (TWCR & (1<<TWINT)) ){
+            // read data
+            if( first_read ) first_read = 0;       // discard the 1st read, need 8 more clocks for real data
+            else{
+               i2rbuf[i2rin++] = TWDR;
+               i2rin &= ( I2RBUFSIZE - 1 );
+               if( --read_qty == 0 ) state = 0;    // done
+            }
+            
+            if( read_qty ){                        // any left ?
+               if( read_qty > 1 ) TWCR = (1<<TWINT) | (1<<TWEN) | (1<<TWEA) | (I2INT_ENABLED);  // not the last read
+               else TWCR = (1<<TWINT) | (1<<TWEN) | (I2INT_ENABLED);                            // nack the last read
+            }
+         }
+      break;    
+   }
+
+   // always test these conditions
+   //      case 0:      // idle state or between characters
+   if( state == 0 ){
+        if( i2in != i2out ){   // get next character
+           data = i2buf[i2out++];
+           i2out &= (I2TBUFSIZE - 1 );
+         
+           if( data & ISTART ){   // start
+              if( data & 1 ) read_qty = data >> 10;     // read queued
+              data &= 0xff;
+              // set start condition
+              TWCR = (1<<TWINT) | (1<<TWSTA) | (1<<TWEN) | (I2INT_ENABLED); 
+              state = 1; 
+           }
+           else if( data & ISTOP ){  // stop
+              // set stop condition
+              TWCR = (1<<TWINT) | (1<<TWEN) | (1<<TWSTO) | (I2INT_ENABLED);
+              state = 3;
+           }
+           else{   // just data to send
+              TWDR = data;
+              TWCR = (1<<TWINT) | (1<<TWEN) | (I2INT_ENABLED);
+              state = 2;
+           }
+        }
+        else TWCR = (1<<TWEN);      // stop interrupts, keep enabled
+      // break;                     // no break, check for stop completion
+   }
+
+   if( state == 3 ){
+      //case 3:  // wait here for stop to clear. TWINT does not return to high and no interrupts happen on stop.
+      //   if( state != 3 ) break;
+         while( 1 ){
+            if( (TWCR & (1<<TWSTO)) == 0 ){
+               state = 0;
+               i2done = 1;           // i2c transaction complete, buffer is free for next one
+               break;
+            }
+         }
+      //break;
+   }
+   
+   if( i2in != i2out ) return (state + 8);
+   else return state;
+}
+
+
+/****************************  
 uint8_t i2poll(){    
 static  uint8_t state = 0;
 static unsigned int data;
@@ -666,8 +758,7 @@ static uint8_t first_read;
    if( i2in != i2out ) return (state + 8);
    else return state;
 }
-
-
+***********************************/
 
 /*********** end I2C functions  ************/
 
@@ -997,7 +1088,7 @@ static int8_t inrx, outrx;            // pipeline indexes
          else{
             ++rx_overruns;              // this would be bad, pipeline is full, cpu is too busy, audio data lost
             //--rx_underruns;           // an overrun may cause an underrun as data was not processed
-         }                              // but not every time so can't assume it will
+         }                              // but not every time so can't adjust the counter
        #endif
          
    }
@@ -1007,7 +1098,7 @@ static int8_t inrx, outrx;            // pipeline indexes
 
 
 
-// IIR filter, LowPass Eliptic, sr 5973, band edges 1400,2000, ripple/reject 0.5db 50db
+// IIR filter, design values:  LowPass Eliptic, sr 5973, band edges 1400,2000, ripple/reject 0.5db 50db
 // two sections a0,a1,a2,b1,b2     Q6 constants
 const int8_t k1[] = {
     (int8_t)( ( 0.287755 + 0.0078125 ) * 64.0 ),
@@ -1023,7 +1114,7 @@ const int8_t k1[] = {
 };
 
 
-// some non-interrupt processing,  will this work from loop(), added a pipeline as it fell behind
+// some non-interrupt rx processing,  will this work from loop(), added a pipeline as it fell behind
 // calc rx_val to be sent to PWM audio on the rx interrupt 
 void rx_process2(){
 int val;
@@ -1054,7 +1145,9 @@ static uint8_t i;
    // need to be at <= 10 bits for this calc
    val *= volume;
    val >>= 6;
-   
+
+   // !!! think about clipping here instead of audio_out function, could make rx_val queue 8 bit.
+   // maybe don't need the audio_out function.
    noInterrupts();
    rx_val[rxin] = val;          // queue value to be sent to audio PWM during timer2 interrupt
    ++rx_ready_flag;
@@ -1122,8 +1215,8 @@ long accm;
           // LCD.printNumI( c, RIGHT, ROW7 );      // polling may cause int flags out of sync with i2state, counts here
           LCD.printNumI( d, LEFT, ROW7 );          // rx_process overruns
           //LCD.printNumI(ADCSRA & 7 , CENTER, ROW7 );    // check auto ADC baud rate value
-          LCD.printNumI( f, CENTER, ROW7 );
-          LCD.printNumI( e, RIGHT, ROW7 );
+          LCD.printNumI( f, CENTER, ROW7 );        // pipeline delay
+          LCD.printNumI( e, RIGHT, ROW7 );         // rx underruns
  }
 #endif
 
