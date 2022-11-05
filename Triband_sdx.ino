@@ -35,6 +35,29 @@
  *            Any press to turn off RIT
  *   
  */
+/**********
+ MIT License
+
+Copyright (c) 2022 Ron Carr
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+*******************/
 
 
 #include <Arduino.h>
@@ -127,25 +150,24 @@ uint8_t vox;
 uint8_t cal = 128;       // final frequency calibration +-500hz
 uint8_t Pmin = 0;
 uint8_t Pmax = 50;
-uint8_t dv;              // dummy var menu placeholder
+//uint8_t dv;              // dummy var menu placeholder
 
-uint8_t ad_ref;          // some bits to merge with the A/D mux bits to select the reference voltage
-
-uint8_t oldband;         // for saving freq in bandstack on band change
-
+uint8_t ad_ref;                    // some bits to merge with the A/D mux bits to select the reference voltage
+uint8_t oldband;                   // for saving freq in bandstack on band change
 uint16_t eeprom_write_pending;     // delay eeprom writes while the user fiddles the values
 
 // receiver vars
-#define PIPE  32                                   // power of 2 buffer size.
-volatile int rx_val[PIPE], Qr[PIPE], Ir[PIPE];     // post processing sample delay pipeline
-volatile uint8_t rx_process_flag;                  // receiver audio lags behind the sampling function up to PIPE size.
-volatile uint8_t rx_ready_flag;
+#define RXPIPE  32                                 // power of 2 buffer size.
+volatile int Qr[RXPIPE], Ir[RXPIPE];               // post processing sample delay pipeline
+volatile uint8_t rx_val[RXPIPE];                   // PWM data buffer
+volatile uint8_t rx_process_flag;                  // receiver audio lags behind the sampling function up to RXPIPE size.
+volatile uint8_t rx_ready_flag;                    // currently it runs about 8 to 10 samples behind
 
 #define FREQ_U 0               // encoder users, tuning and menu
 #define MENU_U 1
 uint8_t encoder_user;
-int    step_ = 1000;
-int8_t tx_inhibit = 1;         // start with a band switches check message before transmit
+int     step_ = 1000;
+uint8_t tx_inhibit = 1;        // start with a band switches check message before transmit
 
 
 #include "si5351_usdx.cpp"     // the si5351 code from the uSDX project, modified slightly for calibrate and RIT
@@ -185,8 +207,8 @@ void setup() {
   analogRead( SW_ADC );                    // enable the ADC the easy way?
   // PRR &= ~( 1 << PRADC );               // adc power reduction bit should be clear
 
-  set_timer1( AUDIO );                     // enable pwm audio out
-  set_timer2( RX );                        // start receiver
+  //set_timer1( AUDIO );                     // enable pwm audio out
+  //set_timer2( RX );                        // start receiver
 
 }
 
@@ -203,7 +225,7 @@ char c;
   
 }
 
-void loop() {
+void looptxtest() {
 static unsigned long tm;
 static unsigned int sec;
 static uint8_t robin;          // round robin some processing, not sure this is needed
@@ -347,6 +369,7 @@ void enc_button(){
        rit_enabled = 0;                             // returns to rx freq as we don't save the tx freq, just in si5351 registers
        freq = freq - freq % step_;                  // clear out LSDigits
        qsy(0);
+       LCD.clrRow(6);
     }
     else{
        switch( sw_state[2] ){
@@ -443,7 +466,7 @@ ISR(TWI_vect){
 }
 
 
-//  found that a slower baud allows the receive process to run better.  Switching to a high baud when transmitting.
+//  found that a slower baud allows the receive process to run better.  Switch to a high baud when transmitting.
 void i2init(){
   TWSR = 0;
   TWBR = 72;    //8  500k, 12 400k, 72 100k   for 16 meg clock. ((F_CPU/freq)-16)/2
@@ -482,9 +505,8 @@ uint8_t t;
   // change baud rate here for si5351 vs OLED ?  17 or 6
   // may be better to just use the transmitting variable or both
   // lets try it.  And find using 125k does free up processing time for the receiver, less interrupt overhead probably
-  //TWBR = ( adr == 0x60 ) ? 6 : 17;  // oled lower priority, we shouldn't write oled while transmitting
-  TWBR = ( transmitting ) ? 6 : 72;  // oled lower priority, we shouldn't be writing the oled while transmitting
-                                     // try 125k ( 72 ) for oled while rx, more time for other stuff
+  //TWBR = ( adr == 0x60 ) ? 4 : 72;  // oled lower priority, we shouldn't write oled while transmitting
+//!!! enable after tx test TWBR = ( transmitting ) ? 4 : 72;  // oled lower priority, we shouldn't be writing the oled while transmitting
   
 }
 
@@ -954,11 +976,86 @@ ISR(TIMER2_COMPB_vect){               // Timer2 COMPB interrupt
    //tx_process();
 }
 
+/*******   tx functions   *******/
 
+int16_t fastAM( int16_t i, int16_t q ){           // estimation of sqrt( i^2 + q^2 )
+
+  /*
+    // quicker version   max + min/4
+       i = abs(i);   q = abs(q);  
+       if( i > q ) q >>= 2;
+       else i >>= 2;
+       return ( i + q );
+  */
+     // better accuracy version   max or 7/8 max + 1/2 min
+int16_t mb4; 
+
+    i = abs(i), q = abs(q);
+    if( i > q ){
+       mb4 = i;   i = q;  q = mb4;
+    }
+    mb4 = q >> 2;
+    if( i < mb4 ) return q;
+    q -= ( mb4 >> 1 );                     // 7/8 * q == q - 1/8q
+    i = i >> 1;
+    
+    return ( i + q );  
+}
+
+
+int16_t arctan3( int16_t q, int16_t i ){           // from QCX-SSB code
+
+  #define _UA   1408                                            // can use arbitrary number 8*22*4*2.  5632 sample rate? 
+  #define _atan2(z)  (((_UA/8 + _UA/22) - _UA/22 * z ) * z)     //uSDX original derived from equation 5 [1].
+  
+  int16_t r;
+  int16_t ai, aq;
+
+  ai = abs(i);  aq = abs(q);
+  if( aq > ai )   r = _UA / 4 - _atan2( ai / aq );  // arctan(z) = 90-arctan(1/z)
+  else r = (i == 0) ? 0 : _atan2( aq / ai );        // arctan(z)
+  r = (i < 0) ? _UA / 2 - r : r;                    // arctan(-z) = -arctan(z)
+  return (q < 0) ? -r : r;                          // arctan(-z) = -arctan(z)
+}
+
+// a 31 tap classic hilbert every other constant is zero, kaiser window
+int16_t valq, vali;                                 // results of hilbert filter are global
+void tx_hilbert( int16_t val ){
+static int16_t wi[31];                              // delay terms
+int16_t t;
+
+const int16_t k0 = (int16_t)( 512.5 * 0.002972769320862211 );
+const int16_t k1 = (int16_t)( 512.5 * 0.008171666650726522 );
+const int16_t k2 = (int16_t)( 512.5 * 0.017465643081957562 );
+const int16_t k3 = (int16_t)( 512.5 * 0.032878923709314147 );
+const int16_t k4 = (int16_t)( 512.5 * 0.058021930268698417 );
+const int16_t k5 = (int16_t)( 512.5 * 0.101629404192315698 );
+const int16_t k6 = (int16_t)( 512.5 * 0.195583262432201366 );
+const int16_t k7 = (int16_t)( 512.5 * 0.629544595185021816 );
+
+   // val = constrain(val,-64,63);                     // avoid overflow, tx clipper
+   // think it will handle 10 bits in with the adjustment on k7 multiply
+   for( int i = 0; i < 30; ++i )  wi[i] = wi[i+1];
+   wi[30] = val;
+
+   valq = wi[15];
+   vali =  k0 * ( wi[0] - wi[30] ) + k1 * ( wi[2] - wi[28] ) + k2 * ( wi[4] - wi[26] ) + k3 * ( wi[6] - wi[24] );
+   vali += k4 * ( wi[8] - wi[22] ) + k5 * ( wi[10] - wi[20]) + k6 * ( wi[12] - wi[18]);  // + k7 * ( wi[14] - wi[16]);
+   vali >>= 9;
+   t = k7/4 * ((wi[14] - wi[16]) >> 2);
+   vali += (t >> 7);
+}
+
+
+
+ 
+
+/****
 void audio_out( int16_t val ){        // clip/saturate values to 8 bits
  
    OCR1AL = constrain( val + 128, 0, 255 );
 }
+***/
 
 
 void sidetone(){                     // can we generate an ok sidetone from just loop
@@ -974,12 +1071,16 @@ int16_t s;
    //s = pgm_read_word( &sin_cos[phase] ); //  sin table is in q12 format
    //s >>= 5;           // divide q12 number by 32, keep numbers in range of int16 or switch to long data types
                         // have -128 to 128 as sine value
+                        
    s = pgm_read_byte( &sin_cos[phase] );   // q6 format, have -64 to 64, half volume, can shift left if want full volume
    s *= side_vol;
-   s >>= 6;             // divide by 64, max volume
-   audio_out( s );
+   s >>= 6;                                // divide by 64, max volume
+   OCR1AL = (uint8_t)(s + 128);
 }
 
+
+
+/*********   RX functions ***********/
 
 // thoughts on sin table phase updates and final freq sampling rate.  Thinking for Weaver mode RX.
 // I think it would not be good to have a phase update that is a divisor of 64, only a couple of values would be used from the table
@@ -1071,17 +1172,17 @@ static int8_t inrx, outrx;            // pipeline indexes
        
        // write last PWM value and queue the calculation of the next one
        if( rx_ready_flag > 0 ){
-           audio_out( rx_val[outrx++] );
-           outrx &= (PIPE-1);
+           OCR1AL = rx_val[outrx++];
+           outrx &= (RXPIPE-1);
            --rx_ready_flag;
        }
        #ifdef I2STATS                     // underrun, no audio data ready to send to PWM process
          else ++rx_underruns;             // expect some starting up, then pipeline starts working
        #endif  
 
-       if( rx_process_flag < (PIPE-1) ){
+       if( rx_process_flag < (RXPIPE-1) ){
           Qr[inrx] = y4;  Ir[inrx++] = z4;
-          inrx &= (PIPE-1);
+          inrx &= (RXPIPE-1);
           ++rx_process_flag;
        }
        #ifdef I2STATS
@@ -1128,7 +1229,7 @@ static uint8_t i;
    Q = Qr[rxout];
    --rx_process_flag;
    interrupts();
-   ++rxout;  rxout &= (PIPE-1);
+   ++rxout;  rxout &= (RXPIPE-1);
 
    I = IIR2( I, k1, wi );
    Q = IIR2( Q, k1, wq );
@@ -1139,6 +1240,7 @@ static uint8_t i;
    val = ( i & 1 ) ? I : Q;
    if( i & 2 ) val = -val;       // get Q,I,-Q,-I...
    // ?? do we need a highpass filter here to remove DC ( sin^2 + cos^2 = 1^2 = 1 )
+   // https://www.dspguide.com/ch19/2.htm
 
    val >>= 2;       // to 8 bits, if iir filter overloads, shift out two bits before IIR2 calls
    
@@ -1146,13 +1248,12 @@ static uint8_t i;
    val *= volume;
    val >>= 6;
 
-   // !!! think about clipping here instead of audio_out function, could make rx_val queue 8 bit.
-   // maybe don't need the audio_out function.
+   val = constrain( val + 128, 0, 255 );     // clip to 8 bits
    noInterrupts();
-   rx_val[rxin] = val;          // queue value to be sent to audio PWM during timer2 interrupt
+   rx_val[rxin] = (uint8_t)val;              // queue value to be sent to audio PWM during timer2 interrupt
    ++rx_ready_flag;
    interrupts();
-   ++rxin;  rxin &= (PIPE-1);
+   ++rxin;  rxin &= (RXPIPE-1);
 
 }
 
@@ -1220,6 +1321,93 @@ long accm;
  }
 #endif
 
+
+// txtest timing loop
+// !!! commment baud change in i2start, then fix when done with this test
+// !!! change made to send bulk, now removed
+// !!! change made to timer setups in setup
+//  best sample rates with small work load, best we can hope for.  I2C bus restricted
+//  baud 4  5785 with waits
+//  baud 1  6447 with waits  .  TWBR as 1 is 1.1111 meg.   TWBR as 2 is 1.0 meg. Not sure Si5351 is receiving these bauds correctly.
+//  full work load, no waits at 9 4207,  best 2 4224 , not much improvement with faster baud after workload restricted
+//  comment out hilbert, no waits at 6 4750
+//  comment out calc fast, 1  6013 with waits,  4 5520, 2 5698, can calc fast be improved?
+//  TWBR = 4 is 833k might be a good setting, might get a tx sample rate of 5400?
+//  full load, one less xfer on I2C, no waits 12 4468 ,  best 2 4494, 4 is 4488
+//     Less transfers would mean less I2C interrupt overhead, we gained 200 hz
+//  small workload, one less I2C xfer, 3 6092, 9 5394, 7 5863 .  4 and 2 have bogus data?
+
+//  Once we have no waits a faster baud will not help much.  1.111 meg may be useful if Si5351 works at that baud.
+//  road to improvement, Speed up calc fast if possible.   Less I2C transfers -> small improvement.
+//  Maybe the Hilbert is too long, gained 500 hz in test without.
+
+void loop(){
+static int twbr = 14;
+static int row = 2;
+unsigned int notdone, loops;
+unsigned long tm;
+static uint16_t btw,bloops,bndone;
+
+   notdone = loops = 0;
+   //set_timer1( 0 );          // !!!! is this off ?, commented out in setup, actually need to stop timer2
+
+   tm = millis();
+   TWBR = twbr;
+   si5351.freq_calc_fast(1000);
+
+   while( i2done == 0 ){
+     noInterrupts();
+     i2poll();
+     interrupts();
+   }
+   while( millis() - tm < 10000 ){
+
+       ++loops;
+
+       tx_hilbert(64);  
+       arctan3(64,23);
+       fastAM(64,23);
+       si5351.freq_calc_fast(1000);  
+       if( i2done == 0 ) ++notdone;
+       while( i2done == 0 ){
+          noInterrupts();
+          i2poll();
+          interrupts();
+       }
+       si5351.SendPLLBRegisterBulk();
+   }
+
+   i2flush();
+   TWBR = 17;
+   LCD.clrRow( row );
+   LCD.printNumI( twbr, LEFT, 8*row );
+   LCD.printNumI( loops, CENTER, 8*row );
+   LCD.printNumI( notdone, RIGHT, 8*row );
+
+   if( loops > bloops ){
+      bndone = notdone;
+      bloops = loops;
+      btw = twbr;
+      LCD.clrRow( 0 );
+      LCD.clrRow( 1 );
+      LCD.setFont( MediumNumbers );
+      LCD.printNumI( btw, LEFT, 0 );
+      LCD.printNumI( bloops/10, CENTER, 0 );
+      LCD.printNumI( bndone/1000, RIGHT, 0 );
+      LCD.setFont( SmallFont );
+   }
+   i2flush();
+   
+   if( twbr > 10) --twbr;    // by two when over 10
+   if( twbr > 20) --twbr;
+   if( twbr > 2 ) --twbr;
+   else{
+      twbr = 14;
+      bndone = 0;  bloops = 0; btw = 29;
+   }
+   if( ++row > 6 ) row = 2;
+   
+}
 
 /***************  temp code that may be useful again for debugging  ***************/
 /***************
