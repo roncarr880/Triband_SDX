@@ -207,8 +207,8 @@ void setup() {
   analogRead( SW_ADC );                    // enable the ADC the easy way?
   // PRR &= ~( 1 << PRADC );               // adc power reduction bit should be clear
 
-  //set_timer1( AUDIO );                     // enable pwm audio out
-  //set_timer2( RX );                        // start receiver
+  set_timer1( AUDIO );                     // enable pwm audio out
+  set_timer2( RX );                        // start receiver
 
 }
 
@@ -225,7 +225,7 @@ char c;
   
 }
 
-void looptxtest() {
+void loop() {
 static unsigned long tm;
 static unsigned int sec;
 static uint8_t robin;          // round robin some processing, not sure this is needed
@@ -423,13 +423,13 @@ void qsy( int8_t f ){
 void calc_divider(){
 uint32_t  f;
 
-   f = freq/1000000;                  // lazy typing way
+   f = freq/1000000;
    divider = 126;
    if( f > 6 ) divider = 100;
    if( f > 9 ) divider = 66;
    if( f > 12 ) divider = 50;
-   if( f > 18 ) divider = 34;
-   if( f > 26 ) divider = 24;
+   if( f > 17 ) divider = 36;
+   if( f > 25 ) divider = 28;
 }
 
 
@@ -506,7 +506,7 @@ uint8_t t;
   // may be better to just use the transmitting variable or both
   // lets try it.  And find using 125k does free up processing time for the receiver, less interrupt overhead probably
   //TWBR = ( adr == 0x60 ) ? 4 : 72;  // oled lower priority, we shouldn't write oled while transmitting
-//!!! enable after tx test TWBR = ( transmitting ) ? 4 : 72;  // oled lower priority, we shouldn't be writing the oled while transmitting
+   TWBR = ( transmitting ) ? 3 : 72;  // oled lower priority, we shouldn't be writing the oled while transmitting
   
 }
 
@@ -1324,8 +1324,8 @@ long accm;
 
 // txtest timing loop
 // !!! commment baud change in i2start, then fix when done with this test
-// !!! change made to send bulk, now removed
-// !!! change made to timer setups in setup
+// !!! comment timer setups in setup
+// !!! check send fast optimization
 //  best sample rates with small work load, best we can hope for.  I2C bus restricted
 //  baud 4  5785 with waits
 //  baud 1  6447 with waits  .  TWBR as 1 is 1.1111 meg.   TWBR as 2 is 1.0 meg. Not sure Si5351 is receiving these bauds correctly.
@@ -1335,13 +1335,25 @@ long accm;
 //  TWBR = 4 is 833k might be a good setting, might get a tx sample rate of 5400?
 //  full load, one less xfer on I2C, no waits 12 4468 ,  best 2 4494, 4 is 4488
 //     Less transfers would mean less I2C interrupt overhead, we gained 200 hz
-//  small workload, one less I2C xfer, 3 6092, 9 5394, 7 5863 .  4 and 2 have bogus data?
+//  small workload, one less I2C xfer, 3 6092, 9 5394, 7 5863 .  I2C bus restricted.  4 and 2 have bogus data?
+//  new calc fast, all have waits 2 6494, I2C bus restricted ( have one less I2C xfer )
+//  comment out send bulk optimization, 2 5603, using i2flush in loop 3 5544, added twbr as 1 5859, 2 5604
+//  add some delay to loop to find where cpu load exceeds i2c load
+//    100us 12 3811,  40us 4 4973, 20us 2 5505 waits, 22us 2 5475 no waits
+//  enable send bulk opt again, less i2c load, 22us 3 5926, 23us 4 5890
+//  random df offsets to calc fast, 20us slow, 0us 14 4115.  Is random function very very slow
+//  back to nowaits norandom, 3 6100, 2 6300 waits.  
+//  disable send bulk again, worse case I2c load,  test to 3, 0us 4 5300 waits, 10us 3 5321 waits 4 5278
+//  enable send bulk again, less I2c load, 10 us 4 5987 3 6096 7 5665 all with waits
+//  still think a sample rate of 5300 to 5400 with twbr as 4 or 3 will work.
+//    Less I2c load 4 is 5987, More I2c load and 4 is 5300. 
+
 
 //  Once we have no waits a faster baud will not help much.  1.111 meg may be useful if Si5351 works at that baud.
 //  road to improvement, Speed up calc fast if possible.   Less I2C transfers -> small improvement.
 //  Maybe the Hilbert is too long, gained 500 hz in test without.
 
-void loop(){
+void looptxtest(){
 static int twbr = 14;
 static int row = 2;
 unsigned int notdone, loops;
@@ -1353,13 +1365,16 @@ static uint16_t btw,bloops,bndone;
 
    tm = millis();
    TWBR = twbr;
-   si5351.freq_calc_fast(1000);
-
+   
+   si5351.freq_calc_fast(1000);   // ?? why is this here
+   i2flush();
+   /*
    while( i2done == 0 ){
      noInterrupts();
      i2poll();
      interrupts();
-   }
+   } */
+   
    while( millis() - tm < 10000 ){
 
        ++loops;
@@ -1367,13 +1382,15 @@ static uint16_t btw,bloops,bndone;
        tx_hilbert(64);  
        arctan3(64,23);
        fastAM(64,23);
-       si5351.freq_calc_fast(1000);  
+       si5351.freq_calc_fast(2700);
+       //delayMicroseconds(10); 
        if( i2done == 0 ) ++notdone;
+       // i2flush();
        while( i2done == 0 ){
           noInterrupts();
           i2poll();
           interrupts();
-       }
+       } 
        si5351.SendPLLBRegisterBulk();
    }
 
@@ -1384,7 +1401,7 @@ static uint16_t btw,bloops,bndone;
    LCD.printNumI( loops, CENTER, 8*row );
    LCD.printNumI( notdone, RIGHT, 8*row );
 
-   if( loops > bloops ){
+   if( loops > bloops ){            // best on top
       bndone = notdone;
       bloops = loops;
       btw = twbr;
@@ -1400,7 +1417,7 @@ static uint16_t btw,bloops,bndone;
    
    if( twbr > 10) --twbr;    // by two when over 10
    if( twbr > 20) --twbr;
-   if( twbr > 2 ) --twbr;
+   if( twbr > 3 ) --twbr;
    else{
       twbr = 14;
       bndone = 0;  bloops = 0; btw = 29;
