@@ -163,6 +163,12 @@ volatile uint8_t rx_val[RXPIPE];                   // PWM data buffer
 volatile uint8_t rx_process_flag;                  // receiver audio lags behind the sampling function up to RXPIPE size.
 volatile uint8_t rx_ready_flag;                    // currently it runs about 8 to 10 samples behind
 
+#define TXPIPE  32
+volatile int TVal[TXPIPE], Phase[TXPIPE];
+volatile uint8_t  Mag[TXPIPE];
+volatile uint8_t tx_process_flag;
+volatile uint8_t tx_ready_flag;
+
 #define FREQ_U 0               // encoder users, tuning and menu
 #define MENU_U 1
 uint8_t encoder_user;
@@ -662,14 +668,15 @@ static uint8_t first_read;
            if( data & ISTART ){   // start
               if( data & 1 ) read_qty = data >> 10;     // read queued
               data &= 0xff;
-              // set start condition
-              TWCR = (1<<TWINT) | (1<<TWSTA) | (1<<TWEN) | (I2INT_ENABLED); 
+              while(TWCR & (1<<TWSTO));                                      // wait for previous stop to clear
+              TWCR = (1<<TWINT) | (1<<TWSTA) | (1<<TWEN) | (I2INT_ENABLED);  // set start condition
               state = 1; 
            }
            else if( data & ISTOP ){  // stop
               // set stop condition
               TWCR = (1<<TWINT) | (1<<TWEN) | (1<<TWSTO) | (I2INT_ENABLED);
-              state = 3;
+              //state = 3;
+              i2done = 1;
            }
            else{   // just data to send
               TWDR = data;
@@ -681,7 +688,8 @@ static uint8_t first_read;
       // break;                     // no break, check for stop completion
    }
 
-   if( state == 3 ){
+  /******
+   if( state == 3 ){     merged this processing into state 0
       //case 3:  // wait here for stop to clear. TWINT does not return to high and no interrupts happen on stop.
       //   if( state != 3 ) break;
          while( 1 ){
@@ -693,6 +701,7 @@ static uint8_t first_read;
          }
       //break;
    }
+   ********/
    
    if( i2in != i2out ) return (state + 8);
    else return state;
@@ -960,7 +969,7 @@ void set_timer2( int8_t mode){
   TIMSK2 = mode;                     // enable interrupts A match or B match, RX TX defines
                                      // OCR2A = (F_CPU / pre-scaler / fs) - 1;
   if( mode == RX ) OCR2A = 51;       // count to value, resets, interrupts, fs = 47786
-  if( mode == TX ) OCR2A = 226;      // fs = 11000
+  if( mode == TX ) OCR2A = 235;      // fs = 10600 int rate,  5300 tx update rate, if change then change _UA
   OCR2B = OCR2A - 1;                 // use the 2nd interrupt for transmit
   TCCR2B = 2;                        // start clocks, divide by 8 clock prescale
   interrupts();
@@ -986,79 +995,117 @@ void tx_hilbert( int16_t val ){
 static int16_t wi[31];                              // delay terms
 int16_t t;
 
-const int16_t k0 = (int16_t)( 512.5 * 0.002972769320862211 );
-const int16_t k1 = (int16_t)( 512.5 * 0.008171666650726522 );
-const int16_t k2 = (int16_t)( 512.5 * 0.017465643081957562 );
-const int16_t k3 = (int16_t)( 512.5 * 0.032878923709314147 );
-const int16_t k4 = (int16_t)( 512.5 * 0.058021930268698417 );
-const int16_t k5 = (int16_t)( 512.5 * 0.101629404192315698 );
-const int16_t k6 = (int16_t)( 512.5 * 0.195583262432201366 );
-const int16_t k7 = (int16_t)( 512.5 * 0.629544595185021816 );
+const int16_t k0 = (int16_t)( 1024.5 * 0.002972769320862211 );     // scale up two bit   195
+const int16_t k1 = (int16_t)( 256.5 * 0.008171666650726522 );      // max worst case     522
+const int16_t k2 = (int16_t)( 256.5 * 0.017465643081957562 );      //                   1142 
+const int16_t k3 = (int16_t)( 256.5 * 0.032878923709314147 );      //                   2154 
+const int16_t k4 = (int16_t)( 256.5 * 0.058021930268698417 );      //                   3786
+const int16_t k5 = (int16_t)( 256.5 * 0.101629404192315698 );      //                   6528
+const int16_t k6 = (int16_t)( 256.5 * 0.195583262432201366 );      //                  13056   27383 tot
+const int16_t k7 = (int16_t)( 256.5 * 0.629544595185021816 );      //
 
-   // val = constrain(val,-64,63);                     // avoid overflow, tx clipper
-   // think it will handle 10 bits in with the adjustment on k7 multiply
+    val = constrain(val,-128,127);                     // avoid overflow, tx clipper
+   // think it will handle 7 bits in with the adjustment on k7 multiply
    for( int i = 0; i < 30; ++i )  wi[i] = wi[i+1];
    wi[30] = val;
 
    valq = wi[15];
-   vali =  k0 * ( wi[0] - wi[30] ) + k1 * ( wi[2] - wi[28] ) + k2 * ( wi[4] - wi[26] ) + k3 * ( wi[6] - wi[24] );
-   vali += k4 * ( wi[8] - wi[22] ) + k5 * ( wi[10] - wi[20]) + k6 * ( wi[12] - wi[18]);  // + k7 * ( wi[14] - wi[16]);
-   vali >>= 9;
-   t = k7/4 * ((wi[14] - wi[16]) >> 2);
-   vali += (t >> 7);
+   vali =  k0 * ( wi[0] - wi[30] ) >> 2;
+   vali += k1 * ( wi[2] - wi[28] ) + k2 * ( wi[4] - wi[26] ) + k3 * ( wi[6] - wi[24] );
+   vali += k4 * ( wi[8] - wi[22] ) + k5 * ( wi[10] - wi[20]) + k6 * ( wi[12] - wi[18]);
+   vali >>= 8;
+   t = k7 * ((wi[14] - wi[16]));
+   vali += (t >> 8);
 }
 
 
 
 
 #define TX_REF (0x40 | 0x80)                 // 1.1 volt reference
-#define _UA   5500                           // can use arbitrary number, but make same as sample rate
+#define _UA   5300                           // can use arbitrary number, but make same as sample rate
 
 void tx_process(){
 int cin;
 static uint8_t R;
 static int16_t y1;
 static int16_t y2, y1d;
-static int16_t mag;
-static int prev_phase;
-int dp, ph;
+static int txin, txout;
 
        cin = ADC - 512;
-       ADMUX = TX_REF | 2;                   // I think we can ignore all button inputs during tx
+       ADMUX = TX_REF | 2;                   // I think we can ignore all button inputs during tx, no stealing ADC readings
        ADCSRA = 0xc0 + 5;                    // next start conversion
 
        // one stage of CIC, final rate is half of interrupt rate
        y1 = y1 + cin;                        // integrator
        R ^= 1;
-       if( R ){                              // precalc mag on this interrupt
-          mag *= Pmax;                       // slope, Pmax is 0 to 63 to stay in 16 bits
-          mag >>= 6;
-          mag += Pmin;                       // y intercept
-          mag = constrain( mag, 0, 255 );    // clip to 8 bits
-          return;
-       }
-
-       OCR1BL = mag;                         // write mag here for 1 sample delay ?
+       if( R ) return;
        
        y2 = y1 - y1d;   y1d = y1;            // comb length 2
        y2 >>= 2;
-       tx_hilbert( y2 );                     // get valq and vali
-       mag = fastAM( vali, valq ) >> 2;      // to 8 bits
-       ph  = arctan3( valq, vali );          // phase
 
-       dp = ph - prev_phase;                 // delta phase
-       prev_phase = ph;
+       if( tx_process_flag < TXPIPE-1 ){
+          TVal[txin++] = y2;
+          ++tx_process_flag;
+          txin &= TXPIPE-1;
+       }
+
+       if( tx_ready_flag ){    
+          OCR1BL = Mag[txout];                         // write mag here for 1 sample delay ?
+          si5351.freq_calc_fast(Phase[txout++]);
+          txout &= TXPIPE-1;
+          --tx_ready_flag;
+          
+          if( i2done )  si5351.SendPLLBRegisterBulk(); 
+          else{                                                 // skip and count error, clear buffer
+              int spins = 0;
+              while( i2done == 0 ) i2poll(), ++spins;           // in interrupt, don't need to turn them off and on here
+              if( spins < 10 ) si5351.SendPLLBRegisterBulk();   // just a little late, maybe the next one will catch up
+              //++errors;
+          }
+       }
+
+}
+
+  // TVal[] Phase[] Mag[]  tx_process_flag  tx_ready_flag
+
+void tx_process2(){          // do as much as possible outside of interrupt context, allows i2c interrupts to run
+static int16_t mag;
+static int prev_phase;
+int dp, phase;
+int y2;
+static uint8_t tx_in, tx_out;
+
+       noInterrupts();
+       y2 = TVal[tx_in++];
+       tx_in &= TXPIPE-1;
+       --tx_process_flag;
+       interrupts();
+
+       tx_hilbert( y2 );                     // get valq and vali
+
+       mag = fastAM( vali, valq ) >> 2;      // to 8 bits
+       mag *= Pmax;                          // slope, Pmax is 0 to 63 to stay in 16 bits
+       mag >>= 6;
+       mag += Pmin;                          // y intercept
+       mag = constrain( mag, 0, 255 );       // clip to 8 bits
+
+       phase  = arctan3( valq, vali );
+
+       dp = phase - prev_phase;              // delta phase
+       prev_phase = phase;
        if( dp < -_UA/2 ) dp += _UA;
        if( mode == LSB ) dp = -dp;
        dp = constrain(dp,-3000,3000);
 
-       si5351.freq_calc_fast(dp);
-       while( i2done == 0 ){                 // should be ready but need to wait if not
+       if( tx_ready_flag < TXPIPE -1 ){
           noInterrupts();
-          i2poll();
+          Phase[tx_out] = dp;
+          Mag[tx_out++] = mag;
+          tx_out &= TXPIPE-1;
+          ++tx_ready_flag;
           interrupts();
        }
-       si5351.SendPLLBRegisterBulk();
+  
 }
 
 int16_t fastAM( int16_t i, int16_t q ){           // estimation of sqrt( i^2 + q^2 )
@@ -1382,7 +1429,8 @@ long accm;
 // !!! check send fast optimization
 //  best sample rates with small work load, best we can hope for.  I2C bus restricted
 //  baud 4  5785 with waits
-//  baud 1  6447 with waits  .  TWBR as 1 is 1.1111 meg.   TWBR as 2 is 1.0 meg. Not sure Si5351 is receiving these bauds correctly.
+//  baud 1  6447 with waits  .
+//  TWBR as 1 is 1.1111 meg.  TWBR as 2 is 1.0 meg. Not sure Si5351 is receiving these bauds correctly.
 //  full work load, no waits at 9 4207,  best 2 4224 , not much improvement with faster baud after workload restricted
 //  comment out hilbert, no waits at 6 4750
 //  comment out calc fast, 1  6013 with waits,  4 5520, 2 5698, can calc fast be improved?
@@ -1390,6 +1438,7 @@ long accm;
 //  full load, one less xfer on I2C, no waits 12 4468 ,  best 2 4494, 4 is 4488
 //     Less transfers would mean less I2C interrupt overhead, we gained 200 hz
 //  small workload, one less I2C xfer, 3 6092, 9 5394, 7 5863 .  I2C bus restricted.  4 and 2 have bogus data?
+
 //  new calc fast, all have waits 2 6494, I2C bus restricted ( have one less I2C xfer )
 //  comment out send bulk optimization, 2 5603, using i2flush in loop 3 5544, added twbr as 1 5859, 2 5604
 //  add some delay to loop to find where cpu load exceeds i2c load
@@ -1404,6 +1453,8 @@ long accm;
 
 
 //  Once we have no waits a faster baud will not help much.  1.111 meg may be useful if Si5351 works at that baud.
+//  Thought a faster baud than needed will add to interrupt overhead, but not really seeing it in this test.
+//  7 I2C xfers say 70 bits will take 84us+overhead at 833 baud
 //  road to improvement, Speed up calc fast if possible.   Less I2C transfers -> small improvement.
 //  Maybe the Hilbert is too long, gained 500 hz in test without.
 
