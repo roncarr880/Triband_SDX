@@ -115,7 +115,7 @@ uint16_t divider;
 uint8_t transmitting;
 int sw_adc;                    // request flag and result of ADC of the switches
 
-uint32_t bandstack[3] = { 21100000UL, 14100000UL, 7100000UL };
+uint32_t bandstack[3] = { 21100000UL, 10106000UL, 7100000UL };
 
 #define I2STATS                // see if the i2c interrupts are functioning and being useful in freeing up cpu time
 #ifdef I2STATS
@@ -147,9 +147,9 @@ uint8_t kspeed = 12;
 uint8_t kmode = 1;
 uint8_t side_vol = 22;
 uint8_t vox;
-uint8_t cal = 128;       // final frequency calibration +-500hz
+uint8_t cal = 128;         // final frequency calibration +-500hz
 uint8_t Pmin = 0;
-uint8_t Pmax = 50;
+uint8_t Pmax = 30;
 //uint8_t dv;              // dummy var menu placeholder
 
 uint8_t ad_ref;                    // some bits to merge with the A/D mux bits to select the reference voltage
@@ -790,7 +790,7 @@ static uint8_t first_read;
 #define NUM_MENU 11
 const char smenu[] PROGMEM = "Vol AttnBandModeKSpdKmdeSvolVox Cal PminPmax    ";      // pad spaces out to multiple of 4 fields
 uint8_t *svar[NUM_MENU] = {&volume,&attn,&band,&mode,&kspeed,&kmode,&side_vol,&vox,&cal,&Pmin,&Pmax};
-uint8_t  smax[NUM_MENU] = {  63,   3,    2,     2,     25,    3,     63,       1,   254, 50,   254 };
+uint8_t  smax[NUM_MENU] = {  63,   3,    2,     2,     25,    3,     63,       1,   254,  20,    63 };
 uint32_t stripee = 0b00000000000000000000011100100000;                         // bit set for strip menu items to save in eeprom
 
 // note: a smax value of 255 will not be restored from eeprom, it looks like erased data.
@@ -959,7 +959,8 @@ void set_timer2( int8_t mode){
   TCCR2A = 2;                        // CTC mode
   TIMSK2 = mode;                     // enable interrupts A match or B match, RX TX defines
                                      // OCR2A = (F_CPU / pre-scaler / fs) - 1;
-  OCR2A = 51;                        // count to value, resets, interrupts, fs = 47786, !!! different value for TX ?
+  if( mode == RX ) OCR2A = 51;       // count to value, resets, interrupts, fs = 47786
+  if( mode == TX ) OCR2A = 226;      // fs = 11000
   OCR2B = OCR2A - 1;                 // use the 2nd interrupt for transmit
   TCCR2B = 2;                        // start clocks, divide by 8 clock prescale
   interrupts();
@@ -973,10 +974,92 @@ ISR(TIMER2_COMPA_vect){               // Timer2 COMPA interrupt
 
 ISR(TIMER2_COMPB_vect){               // Timer2 COMPB interrupt
 
-   //tx_process();
+   if( mode == CW ) ;                 // goto cw functions
+   else tx_process();                  
 }
 
 /*******   tx functions   *******/
+
+// a 31 tap classic hilbert every other constant is zero, kaiser window
+int16_t valq, vali;                                 // results of hilbert filter are global
+void tx_hilbert( int16_t val ){
+static int16_t wi[31];                              // delay terms
+int16_t t;
+
+const int16_t k0 = (int16_t)( 512.5 * 0.002972769320862211 );
+const int16_t k1 = (int16_t)( 512.5 * 0.008171666650726522 );
+const int16_t k2 = (int16_t)( 512.5 * 0.017465643081957562 );
+const int16_t k3 = (int16_t)( 512.5 * 0.032878923709314147 );
+const int16_t k4 = (int16_t)( 512.5 * 0.058021930268698417 );
+const int16_t k5 = (int16_t)( 512.5 * 0.101629404192315698 );
+const int16_t k6 = (int16_t)( 512.5 * 0.195583262432201366 );
+const int16_t k7 = (int16_t)( 512.5 * 0.629544595185021816 );
+
+   // val = constrain(val,-64,63);                     // avoid overflow, tx clipper
+   // think it will handle 10 bits in with the adjustment on k7 multiply
+   for( int i = 0; i < 30; ++i )  wi[i] = wi[i+1];
+   wi[30] = val;
+
+   valq = wi[15];
+   vali =  k0 * ( wi[0] - wi[30] ) + k1 * ( wi[2] - wi[28] ) + k2 * ( wi[4] - wi[26] ) + k3 * ( wi[6] - wi[24] );
+   vali += k4 * ( wi[8] - wi[22] ) + k5 * ( wi[10] - wi[20]) + k6 * ( wi[12] - wi[18]);  // + k7 * ( wi[14] - wi[16]);
+   vali >>= 9;
+   t = k7/4 * ((wi[14] - wi[16]) >> 2);
+   vali += (t >> 7);
+}
+
+
+
+
+#define TX_REF (0x40 | 0x80)                 // 1.1 volt reference
+#define _UA   5500                           // can use arbitrary number, but make same as sample rate
+
+void tx_process(){
+int cin;
+static uint8_t R;
+static int16_t y1;
+static int16_t y2, y1d;
+static int16_t mag;
+static int prev_phase;
+int dp, ph;
+
+       cin = ADC - 512;
+       ADMUX = TX_REF | 2;                   // I think we can ignore all button inputs during tx
+       ADCSRA = 0xc0 + 5;                    // next start conversion
+
+       // one stage of CIC, final rate is half of interrupt rate
+       y1 = y1 + cin;                        // integrator
+       R ^= 1;
+       if( R ){                              // precalc mag on this interrupt
+          mag *= Pmax;                       // slope, Pmax is 0 to 63 to stay in 16 bits
+          mag >>= 6;
+          mag += Pmin;                       // y intercept
+          mag = constrain( mag, 0, 255 );    // clip to 8 bits
+          return;
+       }
+
+       OCR1BL = mag;                         // write mag here for 1 sample delay ?
+       
+       y2 = y1 - y1d;   y1d = y1;            // comb length 2
+       y2 >>= 2;
+       tx_hilbert( y2 );                     // get valq and vali
+       mag = fastAM( vali, valq ) >> 2;      // to 8 bits
+       ph  = arctan3( valq, vali );          // phase
+
+       dp = ph - prev_phase;                 // delta phase
+       prev_phase = ph;
+       if( dp < -_UA/2 ) dp += _UA;
+       if( mode == LSB ) dp = -dp;
+       dp = constrain(dp,-3000,3000);
+
+       si5351.freq_calc_fast(dp);
+       while( i2done == 0 ){                 // should be ready but need to wait if not
+          noInterrupts();
+          i2poll();
+          interrupts();
+       }
+       si5351.SendPLLBRegisterBulk();
+}
 
 int16_t fastAM( int16_t i, int16_t q ){           // estimation of sqrt( i^2 + q^2 )
 
@@ -1005,7 +1088,6 @@ int16_t mb4;
 
 int16_t arctan3( int16_t q, int16_t i ){           // from QCX-SSB code
 
-  #define _UA   1408                                            // can use arbitrary number 8*22*4*2.  5632 sample rate? 
   #define _atan2(z)  (((_UA/8 + _UA/22) - _UA/22 * z ) * z)     //uSDX original derived from equation 5 [1].
   
   int16_t r;
@@ -1016,34 +1098,6 @@ int16_t arctan3( int16_t q, int16_t i ){           // from QCX-SSB code
   else r = (i == 0) ? 0 : _atan2( aq / ai );        // arctan(z)
   r = (i < 0) ? _UA / 2 - r : r;                    // arctan(-z) = -arctan(z)
   return (q < 0) ? -r : r;                          // arctan(-z) = -arctan(z)
-}
-
-// a 31 tap classic hilbert every other constant is zero, kaiser window
-int16_t valq, vali;                                 // results of hilbert filter are global
-void tx_hilbert( int16_t val ){
-static int16_t wi[31];                              // delay terms
-int16_t t;
-
-const int16_t k0 = (int16_t)( 512.5 * 0.002972769320862211 );
-const int16_t k1 = (int16_t)( 512.5 * 0.008171666650726522 );
-const int16_t k2 = (int16_t)( 512.5 * 0.017465643081957562 );
-const int16_t k3 = (int16_t)( 512.5 * 0.032878923709314147 );
-const int16_t k4 = (int16_t)( 512.5 * 0.058021930268698417 );
-const int16_t k5 = (int16_t)( 512.5 * 0.101629404192315698 );
-const int16_t k6 = (int16_t)( 512.5 * 0.195583262432201366 );
-const int16_t k7 = (int16_t)( 512.5 * 0.629544595185021816 );
-
-   // val = constrain(val,-64,63);                     // avoid overflow, tx clipper
-   // think it will handle 10 bits in with the adjustment on k7 multiply
-   for( int i = 0; i < 30; ++i )  wi[i] = wi[i+1];
-   wi[30] = val;
-
-   valq = wi[15];
-   vali =  k0 * ( wi[0] - wi[30] ) + k1 * ( wi[2] - wi[28] ) + k2 * ( wi[4] - wi[26] ) + k3 * ( wi[6] - wi[24] );
-   vali += k4 * ( wi[8] - wi[22] ) + k5 * ( wi[10] - wi[20]) + k6 * ( wi[12] - wi[18]);  // + k7 * ( wi[14] - wi[16]);
-   vali >>= 9;
-   t = k7/4 * ((wi[14] - wi[16]) >> 2);
-   vali += (t >> 7);
 }
 
 
