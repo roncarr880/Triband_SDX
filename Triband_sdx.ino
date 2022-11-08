@@ -71,7 +71,15 @@ SOFTWARE.
 #define SW_ADC A3
 #define AUDIO_PIN 9             // PWM pins
 #define TXMOD_PIN 10
-#define AUDIO  0b10000000       // TCCR1A values
+#define RX_EN  8                // pb0
+#define PTT   13
+#define DIT_PIN   13            // using input_pullup on pin 13
+#define DAH_PIN   12            // 12 is tx audio with cap loading and external pullup, think this is dah
+#define DIT  1
+#define DAH  2
+
+// timer settings
+#define AUDIO  0b10000000       // TCCR1A values, timer1
 #define TXMOD  0b00100000
 #define RX     2                // TIMSK2 interrupt enable bits, for timer2 setup
 #define TX     4
@@ -123,7 +131,10 @@ uint32_t bandstack[3] = { 21100000UL, 10106000UL, 7100000UL };
   uint16_t i2ints;
   uint16_t i2stalls;
   uint16_t rx_overruns;       //  Added other debug counters non-i2c related
-  uint16_t rx_underruns;  
+  uint16_t rx_underruns; 
+  uint16_t tx_overruns;
+  uint16_t tx_underruns;
+  uint16_t tx_i2late; 
 #endif
 
  /* switch states */
@@ -144,12 +155,14 @@ uint8_t attn = 0;
 uint8_t band = 2;        // bands here are numbered 0,1,2    Display as 1,2,3   2 == band 3
 uint8_t mode = 1;
 uint8_t kspeed = 12;
-uint8_t kmode = 1;
-uint8_t side_vol = 22;
-uint8_t vox;
+uint8_t kmode = 1;         // 0 straight, 1 mode A, 2 mode B, 3 Ultimatic, swapped dit and dah same lineup 4,5,6,7
+uint8_t side_vol = 15;
+uint8_t bdelay = 30;
 uint8_t cal = 128;         // final frequency calibration +-500hz
 uint8_t Pmin = 0;
-uint8_t Pmax = 30;
+uint8_t Pmax = 15;         // max is 63;
+uint8_t vox;
+
 //uint8_t dv;              // dummy var menu placeholder
 
 uint8_t ad_ref;                    // some bits to merge with the A/D mux bits to select the reference voltage
@@ -174,6 +187,9 @@ volatile uint8_t tx_ready_flag;
 uint8_t encoder_user;
 int     step_ = 1000;
 uint8_t tx_inhibit = 1;        // start with a band switches check message before transmit
+uint8_t s_tone;                // sidetone independant of actual transmit condition
+volatile int     break_in;     // semi break in counter
+volatile int8_t  waveshape;    // cw wave shaping from sine cosine table
 
 
 #include "si5351_usdx.cpp"     // the si5351 code from the uSDX project, modified slightly for calibrate and RIT
@@ -195,6 +211,9 @@ void setup() {
   digitalWrite(TXMOD_PIN, LOW );           // ? vaguely remember something about leaving this high for better cw shaping
   pinMode( AUDIO_PIN, OUTPUT );
   digitalWrite( AUDIO_PIN, LOW );          // if thumps try the floating the pin as in timer1 startup notes
+  pinMode( RX_EN, OUTPUT );
+  pinMode( PTT, INPUT_PULLUP );            // pin 13, this is also DIT_PIN pin I think
+  pinMode( 12, INPUT );                    // has a 10k pullup, DAH_PIN I think, can swap as hardcoded the actual pin 12 here
 
   i2init();
   LCD.InitLCD();
@@ -215,6 +234,8 @@ void setup() {
 
   set_timer1( AUDIO );                     // enable pwm audio out
   set_timer2( RX );                        // start receiver
+  digitalWrite( RX_EN, HIGH );             // antenna switch
+
 
 }
 
@@ -239,6 +260,7 @@ int t;
 
  // high priority.
   while( rx_process_flag ) rx_process2();
+  while( tx_process_flag ) tx_process2();
  
   if( polling ){               // may need to finish an I2C transfer if the buffer became full and we needed to poll in i2send.
      if( i2done == 0 ){        // a bigger buffer may help,  but screen writes send a bunch of data
@@ -255,7 +277,7 @@ int t;
      if( encoder_user == MENU_U ) strip_menu( 3+t );    // menu commands 2 and 4
   }
 
-  if( transmitting && mode == CW ) sidetone();
+  if( s_tone ) sidetone();
 
   // round robin 1ms processing. Process each on a different loop
   if( robin == 1 ) button_state(), ++robin;
@@ -267,12 +289,20 @@ int t;
   if( tm != millis()){          // 1 ms routines ( a quick 1ms - 20meg clock vs 16meg )
      tm = millis();
      robin = 1;
+     if( mode == CW ) keyer();
+     else ptt();
+
+     noInterrupts();
+     if( break_in ){             // semi break in counter
+        if( --break_in == 0 ) rx();
+     }
+     interrupts();
 
      if( eeprom_write_pending ){
         if( --eeprom_write_pending == 0 ) strip_save();
      }
 
-     if( ++sec == 15000 ){
+     if( ++sec == 15000 ){      // debug printing each 15 seconds
         sec = 0;
         #ifdef I2STATS
           print_i2stats();
@@ -291,14 +321,14 @@ static char last;
         last = 0;
         return 0;
     }
-    last = 8;                               // get the vref up to 5 volts, 8 == invalid switch
     if( sw_adc == -1 ) return last;         // no adc results yet, guess it is same as last time
     val = sw_adc;                           // save value, queue another read
     sw_adc = -1;
-                                            // 860 983 are usdx values for breakpoints in voltage read
-    // last = 0;                                        
+
+    last = 8;                               // get the vref up to 5 volts, 8 == invalid switch
+                                            // 860 983 are usdx values for breakpoints in voltage read                                        
     if( val > 680 ) last = 1;               // select sw
-    if( val > 830 ) last = 2;               // 852   set lower as any sw bounce may false detect select instead of exit
+    if( val > 830 ) last = 2;               // was 852, set lower as any sw bounce may false detect select instead of exit
     if( val > 977 ) last = 4;               // encoder sw
     return last;
 }
@@ -689,7 +719,7 @@ static uint8_t first_read;
    }
 
   /******
-   if( state == 3 ){     merged this processing into state 0
+   if( state == 3 ){     merged this processing into state 0, may not need to wait for stop
       //case 3:  // wait here for stop to clear. TWINT does not return to high and no interrupts happen on stop.
       //   if( state != 3 ) break;
          while( 1 ){
@@ -796,15 +826,15 @@ static uint8_t first_read;
 
 // simple menu with parallel arrays. Any values that do not fit in 0 to 255 will need to be scaled when used.
 // example map( var,0,255,-128,127)
-#define NUM_MENU 11
-const char smenu[] PROGMEM = "Vol AttnBandModeKSpdKmdeSvolVox Cal PminPmax    ";      // pad spaces out to multiple of 4 fields
-uint8_t *svar[NUM_MENU] = {&volume,&attn,&band,&mode,&kspeed,&kmode,&side_vol,&vox,&cal,&Pmin,&Pmax};
-uint8_t  smax[NUM_MENU] = {  63,   3,    2,     2,     25,    3,     63,       1,   254,  20,    63 };
+#define NUM_MENU 12
+const char smenu[] PROGMEM = "Vol AttnBandModeKSpdKmdeSvolBdlyCal PminPmaxVox ";      // pad spaces out to multiple of 4 fields
+uint8_t *svar[NUM_MENU] = {&volume,&attn,&band,&mode,&kspeed,&kmode,&side_vol,&bdelay,&cal,&Pmin,&Pmax,&vox};
+uint8_t  smax[NUM_MENU] = {  63,   3,    2,     2,     25,    7,     63,       100,   254,   20,    63,  1 };
 uint32_t stripee = 0b00000000000000000000011100100000;                         // bit set for strip menu items to save in eeprom
 
 // note: a smax value of 255 will not be restored from eeprom, it looks like erased data.
 //       smax of 1 allows two values for the variable.  Max for band (2) is 3 bands 0,1,2
-//       the zero value for cal is 128 
+//       the zero value for cal is 128 allowing both pos and neg frequency calibration
 // commands: 2,4 encoder, 0 reset entry, 1 select, 3 exit
 void strip_menu( int8_t command ){        
 static uint8_t sel;
@@ -851,6 +881,7 @@ static uint8_t hyper;
 
 // print 4 strings and values from somewhere in the strip menu text, offset will be a page number or group of 4
 const char mode_str[] PROGMEM = "CW USBLSB";
+const char keyer_str[] PROGMEM = " S  A  B Ult S swAswBswU";
 void strip_display( uint8_t offset, uint8_t sel, uint8_t ed ){
 int i,k;
 uint8_t val;
@@ -873,7 +904,11 @@ uint8_t val;
        if( offset == 0 && i == 2 ) val += 1;     // band display, 0,1,2 becomes band 1 2 and 3 
        if( offset == 0 && i == 3 ){              // text for mode
           LCD.gotoRowCol(1,i*6*5);
-          for( k = 0; k < 3; ++k )LCD.putch( pgm_read_byte( &mode_str[3*mode+k] ));
+          for( k = 0; k < 3; ++k ) LCD.putch( pgm_read_byte( &mode_str[3*mode+k] ));
+       }
+       else if( offset == 1 && i == 2 ){         // text for keyer modes and swapped paddles modes
+          LCD.gotoRowCol( 1, i*6*5 );
+          for( k = 0; k < 3; ++k ) LCD.putch( pgm_read_byte( &keyer_str[3*kmode+k] ));
        }
        else LCD.printNumI( val, i*6*5, ROW1,3,' ' );
        LCD.invertText(0);
@@ -901,6 +936,7 @@ int i;
       case 8:  qsy(0);  break;                     // calibrate, implement freq change for user observation
    }
    if( stripee & ( 1 << sel ) ) eeprom_write_pending = 62000;   // 62 quick seconds until eeprom write
+   if( bdelay == 0 ) bdelay = 1;                   // avoid tx hanging on
   
 }
 
@@ -937,6 +973,147 @@ uint8_t val;
 
 /*****    Radio processing   *****/
 
+int read_paddles(){                    // keyer and/or PTT function
+int pdl;
+
+   pdl = digitalRead( DAH_PIN ) << 1;
+   pdl += digitalRead( DIT_PIN );
+   pdl ^= 3;                                                // make logic positive
+   
+   if( (kmode & 4) && mode == CW  ){                        // swap paddles 
+      pdl <<= 1;
+      if( pdl & 4 ) pdl += 1;
+      pdl &= 3;                                             // wire straight key to ring of plug
+   }
+
+   return pdl;
+}
+
+void side_tone_on(){    // can have practice mode, delayed breakin, key waveform shaping
+
+   // use tx_inhibit for practice mode.  Change bands, don't clear the message.
+   // what about the relay for external PA, is that same as rx/tx which is part of the attn?
+   //  no it is mosi PB3, a different pin
+   // !!! put some caps across the audio before putting on some headphones
+   s_tone = 1;
+   if( transmitting == 0 ) tx();
+   noInterrupts();
+   waveshape = 1;                           // waveshape counter to ramp up
+   interrupts();
+   si5351.SendRegister(3, 0b11111011);      // key the drive, no backwave
+}
+
+void side_tone_off(){
+
+   s_tone = 0;
+   noInterrupts();
+   waveshape = -16;
+   interrupts();
+}
+
+
+void ptt(){                        // ssb PTT or straight key via keyer() function
+static uint16_t dbounce;
+static int txing;                  // local dupe of variable transmitting.  uses: delayed breakin, wave shaping, practice mode
+int pdl;
+
+   pdl = digitalRead( PTT ) ^ 1; 
+   dbounce >>= 1;
+   if( pdl ) dbounce |= 0x400; 
+
+   if( mode == CW ){               // straight key mode
+      if( txing && dbounce == 0 ) txing = 0, side_tone_off();
+      else if( txing == 0 && dbounce ) txing = 1, side_tone_on();
+   }
+   else{                           // SSB
+      if( txing && dbounce == 0 ) txing = 0 , rx();
+      else if( txing == 0 && dbounce ) txing = 1, tx(); 
+   }
+}
+
+
+// http://cq-cq.eu/DJ5IL_rt007.pdf      all about the history of keyers
+
+#define WEIGHT 200        // extra weight for keyed element
+
+void keyer( ){            // this function is called once every millisecond
+static int state;
+static int count;
+static int cel;           // current element
+static int nel;           // next element - memory
+static int arm;           // edge triggered memory mask
+static int iam;           // level triggered iambic mask
+int pdl;
+
+
+   if( (kmode & 3) == 0 ){    // straight key mode
+      ptt();
+      return;
+   }
+   pdl = read_paddles();
+   if( count ) --count;
+
+   switch( state ){
+     case 0:                               // idle
+        cel = ( nel ) ? nel : pdl;         // get memory or read the paddles
+        nel = 0;                           // clear memory
+        if( cel == DIT + DAH ) cel = DIT;
+        if( cel == 0 ) break;
+        iam = (DIT+DAH) ^ cel;
+        arm = ( iam ^ pdl ) & iam;         // memory only armed if alternate paddle is not pressed at this time, edge trigger
+                                                    // have set up for mode A
+        if( (kmode & 3) == 2 ) arm = iam;           // mode B - the descent into madness begins.  Level triggered memory.
+        if( (kmode & 3) == 3 ) iam = cel;           // ultimatic mode
+        
+        count = (1500+WEIGHT)/kspeed;               // normally 1200 but running at 20mhz with short timing
+        if( cel == DAH ) count *= 3;
+        state = 1;
+        side_tone_on();
+     break; 
+     case 1:                                  // timing the current element. look for edge of the other paddle
+        if( count ) nel = ( nel ) ? nel : pdl & arm;
+        else{
+           count = 1500/kspeed;
+           state = 2;
+           side_tone_off();
+        }
+     break;   
+     case 2:                                  // timing the inter-element space
+        if( count ) nel = ( nel ) ? nel : pdl & arm;
+        else{
+           nel = ( nel ) ? nel : pdl & iam;   // sample alternate at end of element and element space
+           state = 0;
+        }
+     break;   
+   }
+  
+}
+
+
+
+void tx(){                // change to transmit
+
+    if( tx_inhibit ) return;
+    
+    digitalWrite( RX_EN, LOW );    // mute
+    // !!! turn on the solid state relay for external amp
+    if( mode == CW ) set_timer1( TXMOD+AUDIO );
+    else set_timer1( TXMOD );
+    set_timer2( TX );
+    si5351.SendRegister(3, 0b11111011 );
+    transmitting = 1;  
+}
+
+void rx(){                // change to receive
+
+   // !!! turn off the external amp relay
+    set_timer1( AUDIO );
+    set_timer2( RX ); 
+    transmitting = 0;
+    si5351.SendRegister(3, 0b11111100);
+    digitalWrite( RX_EN, ( attn & 2 ) ? LOW : HIGH ); 
+}
+
 void set_timer1( uint8_t clk ){                // timer 1 is set for 8 bit fixed mode 78k PWM
                                                // enable both PWM's for CW so can hear sidetone
    noInterrupts();
@@ -969,7 +1146,7 @@ void set_timer2( int8_t mode){
   TIMSK2 = mode;                     // enable interrupts A match or B match, RX TX defines
                                      // OCR2A = (F_CPU / pre-scaler / fs) - 1;
   if( mode == RX ) OCR2A = 51;       // count to value, resets, interrupts, fs = 47786
-  if( mode == TX ) OCR2A = 235;      // fs = 10600 int rate,  5300 tx update rate, if change then change _UA
+  if( mode == TX ) OCR2A = 235;      // fs = 10600 int rate,  5300 tx update rate, if change here then change _UA
   OCR2B = OCR2A - 1;                 // use the 2nd interrupt for transmit
   TCCR2B = 2;                        // start clocks, divide by 8 clock prescale
   interrupts();
@@ -983,11 +1160,46 @@ ISR(TIMER2_COMPA_vect){               // Timer2 COMPA interrupt
 
 ISR(TIMER2_COMPB_vect){               // Timer2 COMPB interrupt
 
-   if( mode == CW ) ;                 // goto cw functions
+   if( mode == CW ) cw_process;       // goto cw functions, wave shaping
    else tx_process();                  
 }
 
 /*******   tx functions   *******/
+
+void cw_process(){                    // cw wave shaping from transmit interrupt
+static int8_t c;
+int power;
+int inv;
+
+   if( ++c < 3 ) return;
+   c = 0;
+   if( waveshape > 0 && waveshape < 17 ){    // ramp up cw power
+      power = pgm_read_byte( &sin_cos[waveshape] );
+      power *= 255;
+      power >>= 6;
+      power *= Pmax;
+      power >>= 6;
+      power += Pmin;
+      OCR1BL = constrain(power,0,255);
+      ++waveshape;
+      break_in = 0;
+   }
+   if( waveshape < 0 ){                      // ramp down
+      inv = -waveshape;
+      power = pgm_read_byte( &sin_cos[inv] );
+      power *= 255;
+      power >>= 6;
+      power *= Pmax;
+      power >>= 6;
+      power += Pmin;
+      OCR1BL = constrain(power,0,255);
+      if( ++waveshape == 0 ){
+        si5351.SendRegister(3, 0b11111111);    // tx clock off
+        break_in = 10 * (int)bdelay;      
+      }
+   }
+  
+}
 
 // a 31 tap classic hilbert every other constant is zero, kaiser window
 int16_t valq, vali;                                 // results of hilbert filter are global
@@ -1048,6 +1260,9 @@ static int txin, txout;
           ++tx_process_flag;
           txin &= TXPIPE-1;
        }
+       #ifdef I2STATS
+         else ++tx_overruns;                           // no room in buffer
+       #endif  
 
        if( tx_ready_flag ){    
           OCR1BL = Mag[txout];                         // write mag here for 1 sample delay ?
@@ -1060,9 +1275,14 @@ static int txin, txout;
               int spins = 0;
               while( i2done == 0 ) i2poll(), ++spins;           // in interrupt, don't need to turn them off and on here
               if( spins < 10 ) si5351.SendPLLBRegisterBulk();   // just a little late, maybe the next one will catch up
-              //++errors;
+              #ifdef I2STATS
+                else ++tx_i2late;                               // did not send phase update to si5351
+              #endif  
           }
        }
+       #ifdef I2STATS
+         else ++tx_underruns;                    // nothing ready to send
+       #endif  
 
 }
 
@@ -1149,16 +1369,6 @@ int16_t arctan3( int16_t q, int16_t i ){           // from QCX-SSB code
 
 
 
- 
-
-/****
-void audio_out( int16_t val ){        // clip/saturate values to 8 bits
- 
-   OCR1AL = constrain( val + 128, 0, 255 );
-}
-***/
-
-
 void sidetone(){                     // can we generate an ok sidetone from just loop
 static uint32_t tm;
 static uint8_t  phase;
@@ -1182,13 +1392,6 @@ int16_t s;
 
 
 /*********   RX functions ***********/
-
-// thoughts on sin table phase updates and final freq sampling rate.  Thinking for Weaver mode RX.
-// I think it would not be good to have a phase update that is a divisor of 64, only a couple of values would be used from the table
-//  pretend A/D result Q7.3 -128 + 127  Q7.3 is 10 bits? or Q7.2 with sign bit?
-// Q12 * Q3 is Q15 so shift down 15 after mult???  sign bit???  1 * 5 would be 4096*40
-// think answer is shift down by 12 keeping answer in Q7.3, would want final shift of 3 for 8 bit DAC
-//  or is it Q7.2 with a sign bit and final shift is by 2 ?
 
 //  SIDETONE: phase update is tone *  64 / freq_samp .   600 * 64/3000 = 12.8
 //  RADIO:  freq_samp = bfo tone * 64 / desired phase update.  1500 * 64 / 10 = 9600, avoids interpolation
@@ -1403,22 +1606,34 @@ long accm;
 
 #ifdef I2STATS
  void print_i2stats(){
-           uint16_t a,b,c,d,e,f;
+  
+           if( transmitting ) return;
+           uint16_t a,b,c,d,e,f,g,h,i,j;
            noInterrupts();
            a = i2ints;  b = i2polls;  c = i2stalls;
            i2ints = i2polls = i2stalls = 0;
            d = rx_overruns;  rx_overruns = 0;      // added rx_process debugging to this, commented out i2stats
            e = rx_underruns;  rx_underruns = 0;
            f = rx_ready_flag;
+           g = tx_ready_flag;
+           h = tx_underruns;  tx_underruns = 0;
+           i = tx_overruns;   tx_overruns = 0;
+           j = tx_i2late;      tx_i2late = 0;
            interrupts();
            LCD.clrRow( 7 );
           // LCD.printNumI( a, LEFT, ROW7 );       // should be biggest number, interrupts working
           // LCD.printNumI( b, CENTER, ROW7 );     // some OLED functions may overfill our buffer, polling counts here
           // LCD.printNumI( c, RIGHT, ROW7 );      // polling may cause int flags out of sync with i2state, counts here
+          
           LCD.printNumI( d, LEFT, ROW7 );          // rx_process overruns
           //LCD.printNumI(ADCSRA & 7 , CENTER, ROW7 );    // check auto ADC baud rate value
           LCD.printNumI( f, CENTER, ROW7 );        // pipeline delay
           LCD.printNumI( e, RIGHT, ROW7 );         // rx underruns
+          
+          //LCD.printNumI( j, RIGHT, ROW6 );         // tx i2c late
+          //LCD.printNumI( g, CENTER, ROW7 );        // tx pipeline
+          //LCD.printNumI( h, RIGHT, ROW7 );         // tx underruns
+          //LCD.printNumI( i, LEFT, ROW7 );          // tx overruns  
  }
 #endif
 
@@ -1457,7 +1672,7 @@ long accm;
 //  7 I2C xfers say 70 bits will take 84us+overhead at 833 baud
 //  road to improvement, Speed up calc fast if possible.   Less I2C transfers -> small improvement.
 //  Maybe the Hilbert is too long, gained 500 hz in test without.
-
+/*
 void looptxtest(){
 static int twbr = 14;
 static int row = 2;
@@ -1472,13 +1687,13 @@ static uint16_t btw,bloops,bndone;
    TWBR = twbr;
    
    si5351.freq_calc_fast(1000);   // ?? why is this here
-   i2flush();
-   /*
+   //i2flush();
+   
    while( i2done == 0 ){
      noInterrupts();
      i2poll();
      interrupts();
-   } */
+   } 
    
    while( millis() - tm < 10000 ){
 
@@ -1530,6 +1745,7 @@ static uint16_t btw,bloops,bndone;
    if( ++row > 6 ) row = 2;
    
 }
+*************/
 
 /***************  temp code that may be useful again for debugging  ***************/
 /***************
