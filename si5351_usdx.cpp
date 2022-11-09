@@ -45,23 +45,22 @@ public:
   volatile uint32_t fxtal = F_XTAL;
 
   inline void FAST freq_calc_fast( int16_t df ){
-  int32_t msp1, msp2;                     // ?? would unsigned be any better ?
-                                          // !!! test algorithm for overflow, is 30 mhz worst case, biggest numbers?
+  int32_t msp1, msp2;
 
        msp1 = P1;
        msp2 = P2 + 128L * df;             // P2 moves by 128 each hz
-       if( df > 0 ){
-           while( msp2 > P3 ){
+       //if( df > 0 ){
+           while( msp2 > (int32_t)P3 ){   // need a signed compare here, else negative msp2 is greater than P3
               msp2 -= P3;
               ++msp1;
            }
-       }
-       if( df < 0 ){
+       //}
+       //if( df < 0 ){
            while ( msp2 < 0 ){
               msp2 += P3;
               --msp1;
            }
-       }
+       //}
        
        pll_regs[3] = BB1(msp1);
        pll_regs[4] = BB0(msp1);
