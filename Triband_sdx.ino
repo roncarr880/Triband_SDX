@@ -10,15 +10,15 @@
  *     Good looking display layout.
  * 
  * !!! Hardware mod.  The Si5351 module was NOT converted to run 3.3 volts I2C signals. 
- *     Jumpered pin 27 to 4 and 28 to 5 to get I2C signals to the OLED.  Arduino D2, D3 should not be enabled
- *     I am running 5 volt I2C signals !!!  Standard is to run 3.3 volt I2C.  DO NOT load and give this program a try 
- *     without using a 5 volt Si5351 module and adding the jumper wires OR add level converters as follows:
+ *     Jumpered pin 27 to 4 and 28 to 5 to get I2C signals to the OLED.
+ *     On the display board I used jumpers in place of the diodes ( D1,D2 ) to run the OLED on 5 volts.
  *     
- *     !!! Do not use jumpers if your Si5351 is running with 3.3 volt I2C, Si5351 soldered to the board or Modified module.  
- *     Add level converters instead for SDA, SCL, 3.3 side is ATMega328, 5 volt side is OLED. 
- *     Pin 27 to level converter to pin 4.   Pin 28 to level converter to pin 5.
- *     The Mega328 will now run 3.3 volt I2C, the OLED will be at 5 volt, the Si5351 stays at 3.3 volt
- *     This is an untested idea. Should work, OLED I2C baud is 125k.
+ *     I am running 5 volt I2C signals.   Standard is to run 3.3 volt I2C. I now believe it will be ok to use the jumpers
+ *     if everything on your board has I2C signals at 3.3 volts.  ( an inconsistancy exists between the OLED on 3.3 volts and
+ *     the standard program in that the comments in the program say they are bit banging 5 volt signals to the OLED )  So 
+ *     a danger still exists in burning up your Si5351 if you add the jumpers but run the standard program instead of this
+ *     one ).  To try this program the process should be, load this program -> your OLED will not work.  Then add the 
+ *     jumper wires.  To revert back you should remove the wires, then load the standard program.
  *     
  * RCL filter for audio out.   470 ohm, 100uh, 100n to ground.  Put inductor in series with the existing 470 ohm, and    
  *     add the capacitor to ground on input or output side of the 10uf series capacitor.  
@@ -979,8 +979,8 @@ uint8_t val;
 
 /*****    Radio processing   *****/
 
-int read_paddles(){                    // keyer and/or PTT function
-int pdl;
+int8_t read_paddles(){                    // keyer and/or PTT function
+int8_t pdl;
 
    pdl = digitalRead( DAH_PIN ) << 1;
    pdl += digitalRead( DIT_PIN );
@@ -1018,8 +1018,8 @@ void side_tone_off(){
 
 void ptt(){                        // ssb PTT or straight key via keyer() function
 static uint16_t dbounce;
-static int txing;                  // local dupe of variable transmitting.  uses: delayed breakin, wave shaping, practice mode
-int pdl;
+static int8_t txing;                  // local dupe of variable transmitting.  uses: delayed breakin, wave shaping, practice mode
+int8_t pdl;
 
    pdl = digitalRead( PTT ) ^ 1; 
    dbounce >>= 1;                  // shift bits right, any bit as 1 counts as on, no bits is off, stretches on time slightly
@@ -1041,13 +1041,13 @@ int pdl;
 #define WEIGHT 200        // extra weight for keyed element
 
 void keyer( ){            // this function is called once every millisecond
-static int state;
+static int8_t state;
 static int count;
-static int cel;           // current element
-static int nel;           // next element - memory
-static int arm;           // edge triggered memory mask
-static int iam;           // level triggered iambic mask
-int pdl;
+static int8_t cel;           // current element
+static int8_t nel;           // next element - memory
+static int8_t arm;           // edge triggered memory mask
+static int8_t iam;           // level triggered iambic mask
+int8_t pdl;
 
 
    if( (kmode & 3) == 0 ){    // straight key mode
