@@ -19,6 +19,10 @@
  *     Pin 27 to level converter to pin 4.   Pin 28 to level converter to pin 5.
  *     The Mega328 will now run 3.3 volt I2C, the OLED will be at 5 volt, the Si5351 stays at 3.3 volt
  *     This is an untested idea. Should work, OLED I2C baud is 125k.
+ *     
+ * RCL filter for audio out.   470 ohm, 100uh, 100n to ground.  Put inductor in series with the existing 470 ohm, and    
+ *     add the capacitor to ground on input or output side of the 10uf series capacitor.  
+ *     The two pole filter should cut the 72khz PWM by 30 db.
  * 
  * My process:  compile, AVRDudess, file in user/ron/local/appdata/temp/arduino_build_xxxxxx/, pickit 2 as programmer
  *  ? power up with pickit app to test ?  
@@ -77,6 +81,7 @@ SOFTWARE.
 #define DAH_PIN   12            // 12 is tx audio with cap loading and external pullup, think this is dah
 #define DIT  1
 #define DAH  2
+#define RELAY  11               // solid state relay for keying external amp PB3
 
 // timer settings
 #define AUDIO  0b10000000       // TCCR1A values, timer1
@@ -214,6 +219,8 @@ void setup() {
   pinMode( RX_EN, OUTPUT );
   pinMode( PTT, INPUT_PULLUP );            // pin 13, this is also DIT_PIN pin I think
   pinMode( 12, INPUT );                    // has a 10k pullup, DAH_PIN I think, can swap as hardcoded the actual pin 12 here
+  pinMode( RELAY, OUTPUT );
+  digitalWrite(RELAY,LOW);
 
   i2init();
   LCD.InitLCD();
@@ -846,7 +853,7 @@ static uint8_t hyper;
    hyper ^= 1;
    if( hyper && (command == 2 || command == 4) ) return;   // half speed encoder
 
-   if( command == 0 ) mode = sel = ed = 0;    // menu reset
+   if( command == 0 ) hyper = mode = sel = ed = 0;    // menu reset
    switch( mode ){
        case 0:
           LCD.clrRow(0);  LCD.clrRow(1);      // entry condition, clear area
@@ -936,7 +943,6 @@ int i;
       case 8:  qsy(0);  break;                     // calibrate, implement freq change for user observation
    }
    if( stripee & ( 1 << sel ) ) eeprom_write_pending = 62000;   // 62 quick seconds until eeprom write
-   if( bdelay == 0 ) bdelay = 1;                   // avoid tx hanging on
   
 }
 
@@ -992,9 +998,7 @@ int pdl;
 void side_tone_on(){    // can have practice mode, delayed breakin, key waveform shaping
 
    // use tx_inhibit for practice mode.  Change bands, don't clear the message.
-   // what about the relay for external PA, is that same as rx/tx which is part of the attn?
-   //  no it is mosi PB3, a different pin
-   // !!! put some caps across the audio before putting on some headphones
+   
    s_tone = 1;
    if( transmitting == 0 ) tx();
    noInterrupts();
@@ -1018,8 +1022,8 @@ static int txing;                  // local dupe of variable transmitting.  uses
 int pdl;
 
    pdl = digitalRead( PTT ) ^ 1; 
-   dbounce >>= 1;
-   if( pdl ) dbounce |= 0x400; 
+   dbounce >>= 1;                  // shift bits right, any bit as 1 counts as on, no bits is off, stretches on time slightly
+   if( pdl ) dbounce |= 0x400;     // 1ms delay per bit debounce, 0x400 is 15ms, 0x80 is 8ms
 
    if( mode == CW ){               // straight key mode
       if( txing && dbounce == 0 ) txing = 0, side_tone_off();
@@ -1095,8 +1099,8 @@ void tx(){                // change to transmit
 
     if( tx_inhibit ) return;
     
-    digitalWrite( RX_EN, LOW );    // mute
-    // !!! turn on the solid state relay for external amp
+    digitalWrite( RX_EN, LOW );                 // mute
+    digitalWrite(RELAY,HIGH );                  // solid state relay for external amp
     if( mode == CW ) set_timer1( TXMOD+AUDIO );
     else set_timer1( TXMOD );
     set_timer2( TX );
@@ -1106,12 +1110,12 @@ void tx(){                // change to transmit
 
 void rx(){                // change to receive
 
-   // !!! turn off the external amp relay
     set_timer1( AUDIO );
     set_timer2( RX ); 
     transmitting = 0;
     si5351.SendRegister(3, 0b11111100);
-    digitalWrite( RX_EN, ( attn & 2 ) ? LOW : HIGH ); 
+    digitalWrite(RELAY,LOW);
+    digitalWrite( RX_EN, ( attn & 2 ) ? LOW : HIGH );
 }
 
 void set_timer1( uint8_t clk ){                // timer 1 is set for 8 bit fixed mode 78k PWM
@@ -1174,28 +1178,22 @@ int inv;
    if( ++c < 3 ) return;
    c = 0;
    if( waveshape > 0 && waveshape < 17 ){    // ramp up cw power
-      power = pgm_read_byte( &sin_cos[waveshape] );
-      power *= 255;
-      power >>= 6;
+      power = pgm_read_byte( &sin_cos[waveshape] ) << 2;       // 0 - 256
       power *= Pmax;
       power >>= 6;
-      power += Pmin;
-      OCR1BL = constrain(power,0,255);
+      OCR1BL = constrain(power + Pmin,0,255);
       ++waveshape;
       break_in = 0;
    }
    if( waveshape < 0 ){                      // ramp down
       inv = -waveshape;
-      power = pgm_read_byte( &sin_cos[inv] );
-      power *= 255;
-      power >>= 6;
+      power = pgm_read_byte( &sin_cos[inv] ) << 2;
       power *= Pmax;
       power >>= 6;
-      power += Pmin;
-      OCR1BL = constrain(power,0,255);
+      OCR1BL = constrain(power + Pmin,0,255);
       if( ++waveshape == 0 ){
         si5351.SendRegister(3, 0b11111111);    // tx clock off
-        break_in = 10 * (int)bdelay;      
+        break_in = 10 * (int)bdelay + 1;      
       }
    }
   
@@ -1223,8 +1221,8 @@ const int16_t k7 = (int16_t)( 256.5 * 0.629544595185021816 );      //
 
    valq = wi[15];
    vali =  k0 * ( wi[0] - wi[30] ) >> 2;
-   vali += k1 * ( wi[2] - wi[28] ) + k2 * ( wi[4] - wi[26] ) + k3 * ( wi[6] - wi[24] );
-   vali += k4 * ( wi[8] - wi[22] ) + k5 * ( wi[10] - wi[20]) + k6 * ( wi[12] - wi[18]);
+   vali += k1 * ( wi[2] - wi[28] ) + k2 * ( wi[4] - wi[26] ) + k3 * ( wi[6] - wi[24] ) +
+           k4 * ( wi[8] - wi[22] ) + k5 * ( wi[10] - wi[20]) + k6 * ( wi[12] - wi[18]);
    vali >>= 8;
    t = k7 * ((wi[14] - wi[16]));
    vali += (t >> 8);
@@ -1234,7 +1232,7 @@ const int16_t k7 = (int16_t)( 256.5 * 0.629544595185021816 );      //
 
 
 #define TX_REF (0x40 | 0x80)                 // 1.1 volt reference
-#define _UA   5300                           // can use arbitrary number, but make same as sample rate
+#define _UA   5300                           // make same as sample rate
 
 void tx_process(){
 int cin;
@@ -1274,7 +1272,7 @@ static int txin, txout;
           else{                                                 // skip and count error, clear buffer
               int spins = 0;
               while( i2done == 0 ) i2poll(), ++spins;           // in interrupt, don't need to turn them off and on here
-              if( spins < 10 ) si5351.SendPLLBRegisterBulk();   // just a little late, maybe the next one will catch up
+              if( spins < 8 ) si5351.SendPLLBRegisterBulk();    // just a little late, maybe the next one will catch up
               #ifdef I2STATS
                 else ++tx_i2late;                               // did not send phase update to si5351
               #endif  
@@ -1306,8 +1304,8 @@ static uint8_t tx_in, tx_out;
        mag = fastAM( vali, valq ) >> 2;      // to 8 bits
        mag *= Pmax;                          // slope, Pmax is 0 to 63 to stay in 16 bits
        mag >>= 6;
-       mag += Pmin;                          // y intercept
-       mag = constrain( mag, 0, 255 );       // clip to 8 bits
+       // mag += Pmin;                          // y intercept
+       mag = constrain( mag + Pmin, 0, 255 );   // clip to 8 bits
 
        phase  = arctan3( valq, vali );
 
@@ -1342,7 +1340,7 @@ int16_t mb4;
 
     i = abs(i), q = abs(q);
     if( i > q ){
-       mb4 = i;   i = q;  q = mb4;
+       mb4 = i;   i = q;  q = mb4;         // i ^= q; q ^= i; i ^= q; interesting trick to swap in place
     }
     mb4 = q >> 2;
     if( i < mb4 ) return q;
@@ -1681,7 +1679,6 @@ unsigned long tm;
 static uint16_t btw,bloops,bndone;
 
    notdone = loops = 0;
-   //set_timer1( 0 );          // !!!! is this off ?, commented out in setup, actually need to stop timer2
 
    tm = millis();
    TWBR = twbr;
