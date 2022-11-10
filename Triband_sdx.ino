@@ -128,7 +128,7 @@ uint16_t divider;
 uint8_t transmitting;
 int sw_adc;                    // request flag and result of ADC of the switches
 
-uint32_t bandstack[3] = { 21100000UL, 10106000UL, 7100000UL };
+uint32_t bandstack[3] = { 28250000UL, 21100000UL, 7100000UL };     //10106000UL, 
 
 #define I2STATS                // see if the i2c interrupts are functioning and being useful in freeing up cpu time
 #ifdef I2STATS
@@ -1149,8 +1149,9 @@ void set_timer2( int8_t mode){
   TCCR2A = 2;                        // CTC mode
   TIMSK2 = mode;                     // enable interrupts A match or B match, RX TX defines
                                      // OCR2A = (F_CPU / pre-scaler / fs) - 1;
-  if( mode == RX ) OCR2A = 51;       // count to value, resets, interrupts, fs = 47786
-  if( mode == TX ) OCR2A = 235;      // fs = 10600 int rate,  5300 tx update rate, if change here then change _UA
+                                     // actual fs = f_fcu / ( N * (1 + OCR2A ))
+  if( mode == RX ) OCR2A = 51;       // count to value, resets, interrupts, fs = 48077  
+  if( mode == TX ) OCR2A = 222;      // fs = 11210 int rate,  5605 tx update rate, if change here then change _UA
   OCR2B = OCR2A - 1;                 // use the 2nd interrupt for transmit
   TCCR2B = 2;                        // start clocks, divide by 8 clock prescale
   interrupts();
@@ -1232,7 +1233,7 @@ const int16_t k7 = (int16_t)( 256.5 * 0.629544595185021816 );      //
 
 
 #define TX_REF (0x40 | 0x80)                 // 1.1 volt reference
-#define _UA   5300                           // make same as sample rate
+#define _UA   5605                           // make same as sample rate
 
 void tx_process(){
 int cin;
@@ -1269,12 +1270,12 @@ static int txin, txout;
           --tx_ready_flag;
           
           if( i2done )  si5351.SendPLLBRegisterBulk(); 
-          else{                                                 // skip and count error, clear buffer
-              int spins = 0;
-              while( i2done == 0 ) i2poll(), ++spins;           // in interrupt, don't need to turn them off and on here
-              if( spins < 8 ) si5351.SendPLLBRegisterBulk();    // just a little late, maybe the next one will catch up
+          else{                                                          // skip and count error, clear buffer
+              uint32_t tm = micros();
+              while( i2done == 0 ) i2poll();                             // clear i2 buffer, in interrupt no noInterrupts needed
+              if( micros() - tm  < 10 ) si5351.SendPLLBRegisterBulk();   // just a little late, maybe the next one will catch up
               #ifdef I2STATS
-                else ++tx_i2late;                               // did not send phase update to si5351
+                else ++tx_i2late;                      // did not send phase update to si5351, same freq as last time
               #endif  
           }
        }
@@ -1502,6 +1503,7 @@ static int8_t inrx, outrx;            // pipeline indexes
 
 
 // IIR filter, design values:  LowPass Eliptic, sr 5973, band edges 1400,2000, ripple/reject 0.5db 50db
+// actual sample rate 6009
 // two sections a0,a1,a2,b1,b2     Q6 constants
 const int8_t k1[] = {
     (int8_t)( ( 0.287755 + 0.0078125 ) * 64.0 ),
@@ -1521,8 +1523,9 @@ const int8_t k1[] = {
 // calc rx_val to be sent to PWM audio on the rx interrupt 
 void rx_process2(){
 int val;
-static uint8_t rxout, rxin;     // local indexes rather than shared, hopefully will stay in sync with interrupt processing
+static uint8_t rxout, rxin;     // local indexes rather than shared
 static int16_t wq[6], wi[6];    // IIR filter delay terms
+static int16_t wh[2];           // 1 pole highpass delay terms
 int I,Q;
 static uint8_t i;
 
@@ -1536,13 +1539,14 @@ static uint8_t i;
    I = IIR2( I, k1, wi );
    Q = IIR2( Q, k1, wq );
 
-   // simplest weaver decoder, 90 degree sine, cosine steps, 1493 bfo freq with current sample rate
+   // simplest weaver decoder, 90 degree sine, cosine steps, 1502 bfo freq with current sample rate
    ++i;
    i &= 3;
    val = ( i & 1 ) ? I : Q;
    if( i & 2 ) val = -val;       // get Q,I,-Q,-I...
    // ?? do we need a highpass filter here to remove DC ( sin^2 + cos^2 = 1^2 = 1 )
    // https://www.dspguide.com/ch19/2.htm
+   val = qdhigh(val, wh );
 
    val >>= 2;       // to 8 bits, if iir filter overloads, shift out two bits before IIR2 calls
    
@@ -1559,25 +1563,37 @@ static uint8_t i;
 
 }
 
+// one pole highpass filter  k's are 0.863272, 0.726542, 0, -1, 0   in q6 are 55 46 0 -64 0
+int16_t qdhigh( int16_t inval, int16_t *w ){
+long val;
+
+   // w0 = a0*value + w1*a1 + w2*a2     a2 is zero
+   val = (long)(55 * inval) + (long)(46 * w[1]);
+   *w = val >> 6;
+
+   // val = w0 + (w2)*b2 + (w1)*b1      b2 is zero
+   val = val - (long)(64 * w[1]);
+   val >>= 6;
+   *(w+1) = *w;
+   return (int16_t)val;
+}
 
 //;                storage needed per section, so double for two sections
 //;  5 constants,  a0   a1  a2    b1  b2         using Q6 values
 //;  3 time delay  w0   w1  w2
 //  mults are 8bits * 16bits,  adds are 32 bits
+
 int16_t IIR2( int16_t inval, int8_t k[], int16_t *w ){     // 2 section IIR
 long accm;
 
      accm = 0;
       
    // w0 = a0*value + w1*a1 + w2*a2
-     accm = k[0]*inval + k[1]*w[1] + k[2]*w[2];
-     accm >>= 6;  
-    // if( accm > 32767 ) accm = 32767;         // saturate values in the delay line, use constrain macro?
-    // if( accm < -32768 ) accm = -32768;       // see if really needed before enabling
-     *w = accm;
+     accm = (long)(k[0]*inval) + (long)(k[1]*w[1]) + (long)(k[2]*w[2]);
+     *w = accm >> 6;
      
    // value = w0 + (w2)*b2 + (w1)*b1    and dmov the w terms ( terms backwards for the dmov TMS32xxxx )
-     accm = accm + k[4]*w[2] + k[3]*w[1];
+     accm = accm + (long)(k[4]*w[2]) + (long)(k[3]*w[1]);
      accm >>= 6;
      *(w+2) = *(w+1);  *(w+1) = *w;
 
@@ -1585,21 +1601,15 @@ long accm;
      w += 3;
      
      // w0 = a0*value + w1*a1 + w2*a2
-     accm = k[5]*accm + k[6]*w[1] + k[7]*w[2];
-     accm >>= 6;
-     //if( accm > 32767 ) accm = 32767;         // saturate values in the delay line
-     //if( accm < -32768 ) accm = -32768;     
-     *w = accm;
+     accm = (long)(k[5]*accm) + (long)(k[6]*w[1]) + (long)(k[7]*w[2]);    
+     *w = accm >> 6;
      
    // value = w0 + (w2)*b2 + (w1)*b1    and dmov the w terms
-     accm = accm + k[9]*w[2] + k[8]*w[1];
+     accm = accm + (long)(k[9]*w[2]) + (long)(k[8]*w[1]);
      accm >>= 6;
      *(w+2) = *(w+1);  *(w+1) = *w;
 
-   //  if( accm > 32767 ) accm = 32767;         // saturate return value
-   //  if( accm < -32768 ) accm = -32768;       // should have values near +-512
-
-     return (int16_t)accm;  
+     return (int16_t)accm;
 }
 
 #ifdef I2STATS
