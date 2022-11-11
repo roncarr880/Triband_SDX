@@ -9,7 +9,7 @@
  *        In theory we will have more time to process more complicated receive algorithms.
  *     Good looking display layout.
  * 
- * !!! Hardware mod.  The Si5351 module was NOT converted to run 3.3 volts I2C signals. 
+ * !!! Hardware mods.  The Si5351 module was NOT converted to run 3.3 volts I2C signals. 
  *     Jumpered pin 27 to 4 and 28 to 5 to get I2C signals to the OLED.
  *     On the display board I used jumpers in place of the diodes ( D1,D2 ) to run the OLED on 5 volts.
  *     
@@ -38,6 +38,7 @@
  *            Any press to enable TX after band change, CHECK the switches first!, clears message on screen.
  *            Any press to turn off RIT
  *   
+ *   avr-objdump -S Triband_sdx.ino.elf to see the assembly code
  */
 /**********
  MIT License
@@ -1165,7 +1166,7 @@ ISR(TIMER2_COMPA_vect){               // Timer2 COMPA interrupt
 
 ISR(TIMER2_COMPB_vect){               // Timer2 COMPB interrupt
 
-   if( mode == CW ) cw_process;       // goto cw functions, wave shaping
+   if( mode == CW ) cw_process();       // goto cw functions, wave shaping
    else tx_process();                  
 }
 
@@ -1176,7 +1177,7 @@ static int8_t c;
 int power;
 int inv;
 
-   if( ++c < 3 ) return;
+   if( ++c < 3 ) return;                     // shape, I think mod 3 will be about 5ms
    c = 0;
    if( waveshape > 0 && waveshape < 17 ){    // ramp up cw power
       power = pgm_read_byte( &sin_cos[waveshape] ) << 2;       // 0 - 256
@@ -1191,11 +1192,12 @@ int inv;
       power = pgm_read_byte( &sin_cos[inv] ) << 2;
       power *= Pmax;
       power >>= 6;
-      OCR1BL = constrain(power + Pmin,0,255);
       if( ++waveshape == 0 ){
+        OCR1BL = 0;
         si5351.SendRegister(3, 0b11111111);    // tx clock off
         break_in = 10 * (int)bdelay + 1;      
       }
+      else OCR1BL = constrain(power + Pmin,0,255);
    }
   
 }
@@ -1536,8 +1538,8 @@ static uint8_t i;
    interrupts();
    ++rxout;  rxout &= (RXPIPE-1);
 
-   I = IIR2( I, k1, wi );
-   Q = IIR2( Q, k1, wq );
+  // I = IIR2( I, k1, wi );
+ //  Q = IIR2( Q, k1, wq );
 
    // simplest weaver decoder, 90 degree sine, cosine steps, 1502 bfo freq with current sample rate
    ++i;
@@ -1546,13 +1548,18 @@ static uint8_t i;
    if( i & 2 ) val = -val;       // get Q,I,-Q,-I...
    // ?? do we need a highpass filter here to remove DC ( sin^2 + cos^2 = 1^2 = 1 )
    // https://www.dspguide.com/ch19/2.htm
+  
+   val >>= 2;       // to 8 bits, if iir2 filter overloads, shift out two bits before IIR2 calls
    val = qdhigh(val, wh );
 
-   val >>= 2;       // to 8 bits, if iir filter overloads, shift out two bits before IIR2 calls
-   
+ val = Q >> 2;      // !!! DC receiver
    // need to be at <= 10 bits for this calc
    val *= volume;
    val >>= 6;
+
+// !!! test to see what the 8 bit version of iir2 code looks like, otherwise this is bogus code
+   //static int wv[6];
+   //val = IIR2_8( val, k1, wv );
 
    val = constrain( val + 128, 0, 255 );     // clip to 8 bits
    noInterrupts();
@@ -1563,19 +1570,19 @@ static uint8_t i;
 
 }
 
-// one pole highpass filter  k's are 0.863272, 0.726542, 0, -1, 0   in q6 are 55 46 0 -64 0
+// 8 bit one pole highpass filter  k's are 0.863272, 0.726542, 0, -1, 0   in q6 are 55 46 0 -64 0
 int16_t qdhigh( int16_t inval, int16_t *w ){
-long val;
+int16_t val;
 
    // w0 = a0*value + w1*a1 + w2*a2     a2 is zero
-   val = (long)(55 * inval) + (long)(46 * w[1]);
+   val = 55 * inval + 46 * w[1];
    *w = val >> 6;
 
    // val = w0 + (w2)*b2 + (w1)*b1      b2 is zero
-   val = val - (long)(64 * w[1]);
+   val -= 64 * w[1];
    val >>= 6;
    *(w+1) = *w;
-   return (int16_t)val;
+   return val;
 }
 
 //;                storage needed per section, so double for two sections
@@ -1589,11 +1596,11 @@ long accm;
      accm = 0;
       
    // w0 = a0*value + w1*a1 + w2*a2
-     accm = (long)(k[0]*inval) + (long)(k[1]*w[1]) + (long)(k[2]*w[2]);
+     accm = k[0]*inval + k[1]*w[1] + k[2]*w[2];
      *w = accm >> 6;
      
    // value = w0 + (w2)*b2 + (w1)*b1    and dmov the w terms ( terms backwards for the dmov TMS32xxxx )
-     accm = accm + (long)(k[4]*w[2]) + (long)(k[3]*w[1]);
+     accm = accm + k[4]*w[2] + k[3]*w[1];
      accm >>= 6;
      *(w+2) = *(w+1);  *(w+1) = *w;
 
@@ -1601,16 +1608,47 @@ long accm;
      w += 3;
      
      // w0 = a0*value + w1*a1 + w2*a2
-     accm = (long)(k[5]*accm) + (long)(k[6]*w[1]) + (long)(k[7]*w[2]);    
+     accm = k[5]*accm + k[6]*w[1] + k[7]*w[2];    
      *w = accm >> 6;
      
    // value = w0 + (w2)*b2 + (w1)*b1    and dmov the w terms
-     accm = accm + (long)(k[9]*w[2]) + (long)(k[8]*w[1]);
+     accm = accm + k[9]*w[2] + k[8]*w[1];
      accm >>= 6;
      *(w+2) = *(w+1);  *(w+1) = *w;
 
      return (int16_t)accm;
 }
+
+
+int16_t IIR2_8( int16_t inval, int8_t k[], int16_t *w ){     // 2 section IIR, 8 bit version, max values 128 * 64
+int16_t accm;
+
+     accm = 0;
+      
+   // w0 = a0*value + w1*a1 + w2*a2
+     accm = k[0]*inval + k[1]*w[1] + k[2]*w[2];
+     *w = accm >> 6;
+     
+   // value = w0 + (w2)*b2 + (w1)*b1    and dmov the w terms ( terms backwards for the dmov TMS32xxxx )
+     accm = accm + k[4]*w[2] + k[3]*w[1];
+     accm >>= 6;
+     *(w+2) = *(w+1);  *(w+1) = *w;
+
+   // 2nd section
+     w += 3;
+     
+     // w0 = a0*value + w1*a1 + w2*a2
+     accm = k[5]*accm + k[6]*w[1] + k[7]*w[2];    
+     *w = accm >> 6;
+     
+   // value = w0 + (w2)*b2 + (w1)*b1    and dmov the w terms
+     accm = accm + k[9]*w[2] + k[8]*w[1];
+     accm >>= 6;
+     *(w+2) = *(w+1);  *(w+1) = *w;
+
+     return accm;
+}
+
 
 #ifdef I2STATS
  void print_i2stats(){

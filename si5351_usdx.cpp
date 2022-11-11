@@ -49,18 +49,16 @@ public:
 
        msp1 = P1;
        msp2 = P2 + 128L * df;             // P2 moves by 128 each hz
-       //if( df > 0 ){
-           while( msp2 > (int32_t)P3 ){   // need a signed compare here, else negative msp2 is greater than P3
+       //msp2 = P2 + (long)df << 7;       // no diff in code produced, both use repeated adds and no mult.
+
+           while( msp2 >= (int32_t)P3 ){   // need a signed compare here, else negative msp2 is greater than P3
               msp2 -= P3;
               ++msp1;
            }
-       //}
-       //if( df < 0 ){
            while ( msp2 < 0 ){
               msp2 += P3;
               --msp1;
            }
-       //}
        
        pll_regs[3] = BB1(msp1);
        pll_regs[4] = BB0(msp1);
