@@ -1515,7 +1515,7 @@ const int8_t k1[] = {
     (int8_t)( ( 1.0 + 0.0078125 ) * 64.0 ),
     (int8_t)( ( 0.287755 + 0.0078125 ) * 64.0 ),
     (int8_t)( ( 0.118652 + 0.0078125 ) * 64.0 ),
-    (int8_t)( ( -0,748486 + 0.0078125 ) * 64.0 ),
+    (int8_t)( ( -0.748486 + 0.0078125 ) * 64.0 ),
     (int8_t)( ( 1.114201 + 0.0078125 ) * 64.0 ),
     (int8_t)( ( 1.0 + 0.0078125 ) * 64.0 )
 };
@@ -1538,8 +1538,8 @@ static uint8_t i;
    interrupts();
    ++rxout;  rxout &= (RXPIPE-1);
 
-  // I = IIR2( I, k1, wi );
- //  Q = IIR2( Q, k1, wq );
+   I = IIR2( I, k1, wi );
+   Q = IIR2( Q, k1, wq );
 
    // simplest weaver decoder, 90 degree sine, cosine steps, 1502 bfo freq with current sample rate
    ++i;
@@ -1552,14 +1552,10 @@ static uint8_t i;
    val >>= 2;       // to 8 bits, if iir2 filter overloads, shift out two bits before IIR2 calls
    val = qdhigh(val, wh );
 
- val = Q >> 2;      // !!! DC receiver
+   //val = Q >> 2;      // !!! DC receiver
    // need to be at <= 10 bits for this calc
    val *= volume;
    val >>= 6;
-
-// !!! test to see what the 8 bit version of iir2 code looks like, otherwise this is bogus code
-   //static int wv[6];
-   //val = IIR2_8( val, k1, wv );
 
    val = constrain( val + 128, 0, 255 );     // clip to 8 bits
    noInterrupts();
