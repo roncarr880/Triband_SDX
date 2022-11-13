@@ -159,7 +159,7 @@ int sw_state[3] = {NOTACTIVE,NOTACTIVE,NOTACTIVE};   // state of the switches
 uint8_t volume = 20;
 uint8_t attn = 0;
 uint8_t band = 2;        // bands here are numbered 0,1,2    Display as 1,2,3   2 == band 3
-uint8_t mode = 1;
+uint8_t mode = LSB;
 uint8_t kspeed = 12;
 uint8_t kmode = 1;         // 0 straight, 1 mode A, 2 mode B, 3 Ultimatic, swapped dit and dah same lineup 4,5,6,7
 uint8_t side_vol = 15;
@@ -417,7 +417,7 @@ void enc_button(){
     }
     else{
        switch( sw_state[2] ){
-        case DTAP:        break;                                     // !!! unused function available
+        case DTAP:  si5351.SendRegister(177, 0xA0);    break;       // vfo not in quadrature? !!! unused function available
         case TAP:  step_ = ( step_ == 100 ) ? 1000 : 100;  break;    // toggle tuning step size
         case LONGPRESS:                                              // quick entry to edit volume
            strip_menu(0); strip_menu(1); strip_menu(1);
@@ -458,7 +458,7 @@ void qsy( int8_t f ){
    if( rit_enabled ) freq = (int32_t)freq + f * 10;        // tune by 10 hz
    else freq = (int32_t)freq + f * step_;
    calc_divider();
-   if( mode == LSB ) si5351.freq( freq, 0, 90, divider );
+   if( mode == USB ) si5351.freq( freq, 0, 90, divider );
    else si5351.freq( freq, 90, 0, divider );
    display_freq();
    
@@ -983,9 +983,8 @@ uint8_t val;
 int8_t read_paddles(){                    // keyer and/or PTT function
 int8_t pdl;
 
-   pdl = digitalRead( DAH_PIN ) << 1;
-   pdl += digitalRead( DIT_PIN );
-   pdl ^= 3;                                                // make logic positive
+   pdl = digitalRead( DAH_PIN ) ? 2 : 0;
+   pdl += digitalRead( DIT_PIN ) ? 1 : 0;
    
    if( (kmode & 4) && mode == CW  ){                        // swap paddles 
       pdl <<= 1;
@@ -1151,7 +1150,7 @@ void set_timer2( int8_t mode){
   TIMSK2 = mode;                     // enable interrupts A match or B match, RX TX defines
                                      // OCR2A = (F_CPU / pre-scaler / fs) - 1;
                                      // actual fs = f_fcu / ( N * (1 + OCR2A ))
-  if( mode == RX ) OCR2A = 51;       // count to value, resets, interrupts, fs = 48077  
+  if( mode == RX ) OCR2A = 45;       // count to value, resets, interrupts, fs = 48077:51  54347:45
   if( mode == TX ) OCR2A = 222;      // fs = 11210 int rate,  5605 tx update rate, if change here then change _UA
   OCR2B = OCR2A - 1;                 // use the 2nd interrupt for transmit
   TCCR2B = 2;                        // start clocks, divide by 8 clock prescale
@@ -1400,6 +1399,11 @@ int16_t s;
 //  try 1400 lowpass/bfo and phase update of 15.  5973 sample rate, 23893 effective sample rate, 47786 interrupt rate
 
 
+// signal level globals, can we keep some of the extra CIC bits
+int16_t sig_level;          
+uint8_t bits = 4;           // how many bits to shift out
+
+
 void rx_process(){
 static int a1,b1,c1,a2,b2,c2,d2;       // delay lines for stealing A/D samples for buttons and VOX
 static uint8_t flip;                   // processing I or Q ?
@@ -1445,7 +1449,7 @@ static int8_t inrx, outrx;            // pipeline indexes
        y3 = y2 - y2d;   y2d = y2;         // two comb filters, length is decimation rate ( 4 )
        y4 = y3 - y3d;   y3d = y3;         // but only one delay term is needed as running at 1/4 rate
 
-       y4 >>= 4;                          // shift out extra bits.  Did we gain one real bit with the oversampling?   
+       y4 >>= bits;                       // shift out extra bits.  Did we gain one real bit with the oversampling?  
       
    }
    else{             // process I
@@ -1471,7 +1475,7 @@ static int8_t inrx, outrx;            // pipeline indexes
 
        z3 = z2 - z2d;   z2d = z2;         // two comb filters, length is decimation rate ( 4 )
        z4 = z3 - z3d;   z3d = z3;         // but only one delay term is needed as running at 1/4 rate
-       z4 >>= 4;                          // shift out extra bits
+       z4 >>= bits;                       // shift out extra bits
 
        // have y4 and z4 , I and Q at 1/4 rate
        
@@ -1503,33 +1507,119 @@ static int8_t inrx, outrx;            // pipeline indexes
 
 
 
-
+/*
 // IIR filter, design values:  LowPass Eliptic, sr 5973, band edges 1400,2000, ripple/reject 0.5db 50db
-// actual sample rate 6009
+// actual sample rate 6009                               has a ringing/distortionl,I think at the weaver bfo
 // two sections a0,a1,a2,b1,b2     Q6 constants
 const int8_t k1[] = {
-    (int8_t)( ( 0.287755 + 0.0078125 ) * 64.0 ),
-    (int8_t)( ( 0.614265 + 0.0078125 ) * 64.0 ),
-    (int8_t)( ( -0.250054 + 0.0078125 ) * 64.0 ),
-    (int8_t)( ( 1.793725 + 0.0078125 ) * 64.0 ),
-    (int8_t)( ( 1.0 + 0.0078125 ) * 64.0 ),
-    (int8_t)( ( 0.287755 + 0.0078125 ) * 64.0 ),
-    (int8_t)( ( 0.118652 + 0.0078125 ) * 64.0 ),
-    (int8_t)( ( -0.748486 + 0.0078125 ) * 64.0 ),
-    (int8_t)( ( 1.114201 + 0.0078125 ) * 64.0 ),
-    (int8_t)( ( 1.0 + 0.0078125 ) * 64.0 )
+    (int8_t)( ( 0.287755 ) * 64.0 ),
+    (int8_t)( ( 0.614265 ) * 64.0 ),
+    (int8_t)( ( -0.250054 ) * 64.0 ),
+    (int8_t)( ( 1.793725  ) * 64.0 ),
+    (int8_t)( ( 1.0 ) * 64.0 ),
+    (int8_t)( ( 0.287755  ) * 64.0 ),
+    (int8_t)( ( 0.118652  ) * 64.0 ),
+    (int8_t)( ( -0.748486 ) * 64.0 ),
+    (int8_t)( ( 1.114201  ) * 64.0 ),
+    (int8_t)( ( 1.0 ) * 64.0 )
+};
+*/
+// Lowpass Eliptic, sr 6000, 1500 2200,  0.2 50    Also rings.
+const int8_t k1[] = {
+    (int8_t)( ( 0.335063 ) * 64.0 ),
+    (int8_t)( ( 0.333035 ) * 64.0 ),
+    (int8_t)( ( -0.15957 ) * 64.0 ),
+    (int8_t)( ( 1.876546  ) * 64.0 ),
+    (int8_t)( ( 1.0 ) * 64.0 ),
+    (int8_t)( ( 0.335063  ) * 64.0 ),
+    (int8_t)( ( -0.143943  ) * 64.0 ),
+    (int8_t)( ( -0.695227 ) * 64.0 ),
+    (int8_t)( ( 1.413391  ) * 64.0 ),
+    (int8_t)( ( 1.0 ) * 64.0 )
 };
 
+// 2 section butterworth, 1300hz  cutoff, 6000 hz sample rate 
+const int8_t k1bw[] = {               // a0 a1 a2, for butterworth b1 is always 2.0,  b2 is 1.0
+  (int8_t)( ( 0.244851  ) * 64.0 ),
+  (int8_t)( ( 0.218430  ) * 64.0 ),
+  (int8_t)( ( -0.050591  ) * 64.0 ),
 
+  (int8_t)( ( 0.244851 ) * 64.0 ),
+  (int8_t)( ( 0.302566  ) * 64.0 ),
+  (int8_t)( ( -0.455264  ) * 64.0 )
+  
+};
+
+/*
+// 2 section Cheby 1500hz cutoff 0.3db 45db.  Can run with butterworth function as b1 b2 is 2.0 and 1.0
+const int8_t k1ch[] = {                       // sounds good with highs present, may be the station I am listening to
+  (int8_t)( ( 0.290464  ) * 64.0 ),           // audio image rejection not as good as the eliptic
+  (int8_t)( ( 0.394597  ) * 64.0 ),           // has funny ringing at 3k, aliasing? 
+  (int8_t)( ( -0.157573  ) * 64.0 ),
+
+  (int8_t)( ( 0.290464 ) * 64.0 ),
+  (int8_t)( ( -0.15003  ) * 64.0 ),
+  (int8_t)( ( -0.660443  ) * 64.0 )
+  
+};
+*/
+
+// 2 section Cheby 1400hz cutoff 0.3db 45db.  Can run with butterworth function as b1 b2 is 2.0 and 1.0, rings AGC issue?
+const int8_t k1ch[] = { 
+  (int8_t)( ( 0.245772  ) * 64.0 ),
+  (int8_t)( ( 0.587437  ) * 64.0 ), 
+  (int8_t)( ( -0.208894  ) * 64.0 ),
+
+  (int8_t)( ( 0.245772) * 64.0 ),
+  (int8_t)( ( 0.070725 ) * 64.0 ),
+  (int8_t)( ( -0.680535  ) * 64.0 )
+  
+};
+
+// special 3 section butterworth, 1/4 sample rate cutoff.  Constants hardcoded, many constants are zero.
+// needs 9 delay terms, k's are .309, 0, .017332, 2, 1.  .309, 0, 0.171573, 2, 1.  .309, 0, -0.588791, 2, 1
+int16_t  IIR3sp( int16_t val, int16_t *w ){
+long accm;
+      
+   // w0 = a0*value + w1*a1 + w2*a2    a1 is zero
+     accm = 20*val + w[2];
+     accm >>= 6;
+     *w = accm;
+     
+   // value = w0 + (w2)*b2 + (w1)*b1    and dmov the w terms ( terms backwards for the dmov TMS32xxxx )
+     accm = accm + w[2] + w[1] + w[1];     // b1 = 2, b2 = 1
+     *(w+2) = *(w+1);  *(w+1) = *w;
+
+     w += 3;      // second section
+
+     accm = 20*accm + 11 * w[2];
+     accm >>= 6;
+     *w = accm;
+     accm = accm + w[2] + w[1] + w[1];     // b1 = 2, b2 = 1
+     *(w+2) = *(w+1);  *(w+1) = *w;
+
+     w += 3;      // third section
+
+     accm = 20*accm - 38 * w[2];
+     accm >>= 6;
+     *w = accm;
+     accm = accm + w[2] + w[1] + w[1];
+     *(w+2) = *(w+1);  *(w+1) = *w;
+     
+}
+
+/*    Weaver mode, bfo leaks through on weak signals
 // some non-interrupt rx processing,  will this work from loop(), added a pipeline as it fell behind
 // calc rx_val to be sent to PWM audio on the rx interrupt 
 void rx_process2(){
 int val;
 static uint8_t rxout, rxin;     // local indexes rather than shared
-static int16_t wq[6], wi[6];    // IIR filter delay terms
+static int16_t wq[9], wi[9];    // IIR filter delay terms
 static int16_t wh[2];           // 1 pole highpass delay terms
 int I,Q;
 static uint8_t i;
+static int16_t agc = 1;
+static uint8_t agc_counter;
 
    noInterrupts();
    I = Ir[rxout];
@@ -1538,26 +1628,45 @@ static uint8_t i;
    interrupts();
    ++rxout;  rxout &= (RXPIPE-1);
 
-   I = IIR2( I, k1, wi );
-   Q = IIR2( Q, k1, wq );
+   if( I > sig_level ) sig_level = I;                // peak signal detect
+   if( agc_counter == 0 ){
+      noInterrupts();                                // keeping some of the extra CIC bits
+      if( sig_level > 256 && bits < 4 ) ++bits;
+      else if( sig_level < 16 and bits > 1 ) --bits;
+      sig_level = 0;
+      interrupts();
+   }
+
+   //I = IIR2( I, k1, wi );        // 2 section eliptic filter, longer processing time
+   //Q = IIR2( Q, k1, wq );
+
+   //I = IIR2BW( I, k1ch, wi );       // 2 section butterworth or cheby
+   //Q = IIR2BW( Q, k1ch, wq );
+
+   I = IIR3sp( I, wi );              // 3 section special butterworth 1/4 sr cutoff
+   Q = IIR3sp( Q, wq );
 
    // simplest weaver decoder, 90 degree sine, cosine steps, 1502 bfo freq with current sample rate
    ++i;
    i &= 3;
    val = ( i & 1 ) ? I : Q;
    if( i & 2 ) val = -val;       // get Q,I,-Q,-I...
+   
    // ?? do we need a highpass filter here to remove DC ( sin^2 + cos^2 = 1^2 = 1 )
    // https://www.dspguide.com/ch19/2.htm
-  
+   
    val >>= 2;       // to 8 bits, if iir2 filter overloads, shift out two bits before IIR2 calls
    val = qdhigh(val, wh );
-
-   //val = Q >> 2;      // !!! DC receiver
+   
+  // val = Q >> 2;      // !!! DC receiver
    // need to be at <= 10 bits for this calc
-   val *= volume;
+   val *= agc;   // volume or agc
    val >>= 6;
 
-   val = constrain( val + 128, 0, 255 );     // clip to 8 bits
+   if( ++agc_counter == 0 && agc < 4*volume ) ++agc;
+   if( abs(val) > 2*volume ) --agc;
+
+   val = constrain( val + 128, 0, 255 );     // clip to 8 bits, zero offset for PWM
    noInterrupts();
    rx_val[rxin] = (uint8_t)val;              // queue value to be sent to audio PWM during timer2 interrupt
    ++rx_ready_flag;
@@ -1565,6 +1674,64 @@ static uint8_t i;
    ++rxin;  rxin &= (RXPIPE-1);
 
 }
+********/
+
+
+// some non-interrupt rx processing,  will this work from loop(), added a pipeline as it fell behind
+// calc rx_val to be sent to PWM audio on the rx interrupt.  Hilbert phasing version
+void rx_process2(){
+int val;
+static uint8_t rxout, rxin;     // local indexes rather than shared
+//static int16_t wq[9], wi[9];    // IIR filter delay terms
+//static int16_t wh[2];           // 1 pole highpass delay terms
+int I,Q;
+static uint8_t i;
+static int16_t agc = 1;
+static uint8_t agc_counter;
+static int16_t q_delay[16];
+static int16_t w[9];
+
+   noInterrupts();
+   I = Ir[rxout];
+   Q = Qr[rxout];
+   --rx_process_flag;
+   interrupts();
+   ++rxout;  rxout &= (RXPIPE-1);
+
+   if( I > sig_level ) sig_level = I;                // peak signal detect
+   if( agc_counter == 0 ){
+      noInterrupts();                                // keeping some of the extra CIC bits
+      if( sig_level > 96 && bits < 6 ) ++bits;       // 10 bit to 8 bit and 2 CIC bits in play
+      else if( sig_level < 24 and bits > 2 ) --bits;
+      sig_level = 0;
+      interrupts();
+   }
+
+   tx_hilbert( I );    // !!! not shifted down by 2 I and Q - have CIC shift out 1 - 6 bits, 8 bit here
+   I = vali;
+   for( i = 0; i < 15; ++i )  q_delay[i] = q_delay[i+1];
+   q_delay[15] = Q;
+   Q = q_delay[0];
+
+   val = I - Q;
+
+   // if( mode == CW ) val = IIR3sp( val, w );    cpu load and not effective
+   
+   val *= agc;   // volume or agc
+   val >>= 6;
+
+   if( ++agc_counter == 0 && agc < volume ) ++agc;
+   if( abs(val) > 2*volume ) --agc;
+
+   val = constrain( val + 128, 0, 255 );     // clip to 8 bits, zero offset for PWM
+   noInterrupts();
+   rx_val[rxin] = (uint8_t)val;              // queue value to be sent to audio PWM during timer2 interrupt
+   ++rx_ready_flag;
+   interrupts();
+   ++rxin;  rxin &= (RXPIPE-1);
+
+}
+
 
 // 8 bit one pole highpass filter  k's are 0.863272, 0.726542, 0, -1, 0   in q6 are 55 46 0 -64 0
 int16_t qdhigh( int16_t inval, int16_t *w ){
@@ -1581,6 +1748,35 @@ int16_t val;
    return val;
 }
 
+
+//  6 constants.  a0 a1 a2    a0 a1 a2.  b1 is 2.0  b2 is 1.0
+//  6 time delay, 3 for each section
+int16_t IIR2BW( int16_t inval, int8_t k[], int16_t *w ){   // 2 section IIR butterworth
+long accm;
+      
+   // w0 = a0*value + w1*a1 + w2*a2
+     accm = k[0]*inval + k[1]*w[1] + k[2]*w[2];
+     accm >>= 6;
+     *w = accm;
+     
+   // value = w0 + (w2)*b2 + (w1)*b1    and dmov the w terms ( terms backwards for the dmov TMS32xxxx )
+     accm = accm + w[2] + w[1] + w[1];     // b1 = 2, b2 = 1
+     *(w+2) = *(w+1);  *(w+1) = *w;
+
+     w += 3;      // second section
+
+        // w0 = a0*value + w1*a1 + w2*a2
+     accm = k[3]*inval + k[4]*w[1] + k[5]*w[2];
+     accm >>= 6;
+     *w = accm;
+
+   // value = w0 + (w2)*b2 + (w1)*b1    and dmov the w terms ( terms backwards for the dmov TMS32xxxx )
+     accm = accm + w[2] + w[1] + w[1];
+     *(w+2) = *(w+1);  *(w+1) = *w;
+    
+     return (int16_t)accm;
+}
+
 //;                storage needed per section, so double for two sections
 //;  5 constants,  a0   a1  a2    b1  b2         using Q6 values
 //;  3 time delay  w0   w1  w2
@@ -1589,7 +1785,7 @@ int16_t val;
 int16_t IIR2( int16_t inval, int8_t k[], int16_t *w ){     // 2 section IIR
 long accm;
 
-     accm = 0;
+     //accm = 0;
       
    // w0 = a0*value + w1*a1 + w2*a2
      accm = k[0]*inval + k[1]*w[1] + k[2]*w[2];
