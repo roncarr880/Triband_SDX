@@ -1150,7 +1150,7 @@ void set_timer2( int8_t mode){
   TIMSK2 = mode;                     // enable interrupts A match or B match, RX TX defines
                                      // OCR2A = (F_CPU / pre-scaler / fs) - 1;
                                      // actual fs = f_fcu / ( N * (1 + OCR2A ))
-  if( mode == RX ) OCR2A = 45;       // count to value, resets, interrupts, fs = 48077:51  54347:45
+  if( mode == RX ) OCR2A = 51;       // count to value, resets, interrupts, fs = 48077:51  54347:45
   if( mode == TX ) OCR2A = 222;      // fs = 11210 int rate,  5605 tx update rate, if change here then change _UA
   OCR2B = OCR2A - 1;                 // use the 2nd interrupt for transmit
   TCCR2B = 2;                        // start clocks, divide by 8 clock prescale
@@ -1203,6 +1203,7 @@ int inv;
 
 // a 31 tap classic hilbert every other constant is zero, kaiser window
 int16_t valq, vali;                                 // results of hilbert filter are global
+
 void tx_hilbert( int16_t val ){
 static int16_t wi[31];                              // delay terms
 int16_t t;
@@ -1412,12 +1413,12 @@ static uint8_t adps = 4;               // self adjusting adc clock rate, should 
                                        
 
 // https://www.dsprelated.com/showarticle/1337.php
-// CIC filter terms.  Integrate, decimate by 4, Comb filter ( length 4 but only need one delay )
-static int y1,y2,y3,y4;               // 16 bit calculation, input values of 10 bit should produce 14 bit result.
-static int y2d, y3d;                  // delay terms
-static int8_t R;                      // decimation Rate
-static int z1,z2,z3,z4;
-static int z2d, z3d;
+// CIC filter terms.  Integrate, decimate by 4, Comb filter N=3 R=4 M=1
+static int y1,y2,y3,y4,y5,y6;              // 16 bit calculation, input values of 10 bit should produce 16 bit result.
+static int y3d, y4d, y5d;                  // delay terms
+static int8_t R;                           // decimation Rate
+static int z1,z2,z3,z4,z5,z6;
+static int z3d, z4d, z5d;
 
 static int8_t inrx, outrx;            // pipeline indexes
 
@@ -1438,16 +1439,17 @@ static int8_t inrx, outrx;            // pipeline indexes
                                                                      // c1 is bogus at this point, fixed next time when it is b1
 
        // CIC filtering
-       y2 = y2 + ( y1 = y1 + a1 );        // two cascaded integrators, input is a1
+       y3 = y3 + (y2 = y2 + ( y1 = y1 + a1 ));        // three cascaded integrators, input is a1
        a1 = b1; b1 = c1;                  // move the A/D delay line
        R = (R+1) & 3;                     // mod 4 counter
        if( R ) return;                    // decimate by 4, process on zero, skip 1 2 3
        
                                           // 1/4 rate processing
-       y3 = y2 - y2d;   y2d = y2;         // two comb filters, length is decimation rate ( 4 )
-       y4 = y3 - y3d;   y3d = y3;         // but only one delay term is needed as running at 1/4 rate
+       y4 = y3 - y3d;   y3d = y3;         // three comb filters, length is decimation rate ( 4 )
+       y5 = y4 - y4d;   y4d = y4;         // but only one delay term is needed as running at 1/4 rate
+       y6 = y5 - y5d;   y5d = y5;
 
-       y4 >>= bits;                       // shift out extra bits.  
+       y6 >>= bits;                       // shift out extra bits.  
       
    }
    else{             // process I
@@ -1465,17 +1467,18 @@ static int8_t inrx, outrx;            // pipeline indexes
        a2 = ( a2 + b2 ) >> 1;                // half sample delay
 
        // process a2
-       z2 = z2 + ( z1 = z1 + a2 );           // two cascaded integrators
+       z3 = z3 + (z2 = z2 + ( z1 = z1 + a2 ));           // three cascaded integrators
        a2 = b2;  b2 = c2;  c2 = d2;          // move A/D delay terms, extra term for 1/2 sample delay
 
        // R = (R+1) & 3;                     // this was done in above code
        if( R ) return;                       // decimate by 4
 
-       z3 = z2 - z2d;   z2d = z2;         // two comb filters, length is decimation rate ( 4 )
-       z4 = z3 - z3d;   z3d = z3;         // but only one delay term is needed as running at 1/4 rate
-       z4 >>= bits;                       // shift out extra bits
+       z4 = z3 - z3d;   z3d = z3;         // three comb filters, length is decimation rate ( 4 )
+       z5 = z4 - z4d;   z4d = z4;         // but only one delay term is needed as running at 1/4 rate
+       z6 = z5 - z5d;   z5d = z5;
+       z6 >>= bits;                       // shift out extra bits
 
-       // have y4 and z4 , I and Q at 1/4 rate
+       // have y6 and z6 , I and Q at 1/4 rate
        
        // write last PWM value and queue the calculation of the next one
        if( rx_ready_flag > 0 ){
@@ -1488,7 +1491,7 @@ static int8_t inrx, outrx;            // pipeline indexes
        #endif  
 
        if( rx_process_flag < (RXPIPE-1) ){
-          Qr[inrx] = y4;  Ir[inrx++] = z4;
+          Qr[inrx] = y6;  Ir[inrx++] = z6;
           inrx &= (RXPIPE-1);
           ++rx_process_flag;
        }
@@ -1517,8 +1520,9 @@ const int8_t k1bw[] = {               // a0 a1 a2, for butterworth b1 is always 
 };
 
 
-// some non-interrupt rx processing,  will this work from loop(), added a pipeline as it fell behind
+// some non-interrupt rx processing,  will this work from loop(), added a pipeline as it fell behind.
 // calc rx_val to be sent to PWM audio on the rx interrupt.  Hilbert phasing version
+// hear some images out of the CIC filter, at delta 24k 48k,  increased the length to 3.
 void rx_process2(){
 int val;
 static uint8_t rxout, rxin;
@@ -1537,15 +1541,15 @@ static int16_t wi[6],wq[6];
    interrupts();
    ++rxout;  rxout &= (RXPIPE-1);
 
-   // at 14 bits, need to go to 8 bits while keeping as many information bits as possible
-   // impliment a 4 bit compressor, always drop 2 bits, bits are dropped in the CIC filter process
+   // at 16 bits, need to go to 8 bits while keeping as many information bits as possible
+   // impliment a 4 bit compressor, always drop 4 bits, bits are dropped in the CIC filter process
 
-   if( I > sig_level ) sig_level = I;                // peak signal detect
+   if( I > sig_level ) sig_level = I;                    // peak signal detect
    
    if( ++agc_counter == 0 ){
       noInterrupts();        
-      if( sig_level > 96 && bits < 6  ) ++bits;           // 6 db steps makes small clicks on loud sigs, put attn on?
-      else if( sig_level < 40 && bits > 2 ) --bits;      // always drop 2 bits of the 14, just noise bits I think, 40
+      if( sig_level > 96 && bits < 8  ) ++bits;          // 6 db steps makes small clicks on loud sigs, put attn on?
+      else if( sig_level < 40 && bits > 4 ) --bits;      // always drop 4 bits of the 16, just noise bits I think, 40
       sig_level = 0;
       interrupts();
       if( agc < volume ) ++agc;     
@@ -1566,7 +1570,8 @@ static int16_t wi[6],wq[6];
    val *= agc;   // volume or agc
    val >>= 6;
    
-   if( val > 2*volume ) --agc;                  // volume ranges 0 to 63, signal +- 128
+   if( val > 2*(int)volume ) --agc;                  // volume ranges 0 to 63, signal +- 128
+   if( mode == CW ) val = IIRcw8( val );
    
    val = constrain( val + 128, 0, 255 );             // clip to 8 bits, zero offset for PWM
 
@@ -1579,8 +1584,19 @@ static int16_t wi[6],wq[6];
 }
 
 
-// !!! probably should have a two section 8 bit butterworth for 1/4 sample rate cut off
+int16_t IIRcw8( int16_t inval ){
+static int16_t w[3];
+int16_t accm;
 
+   accm = 10*inval + 40*w[1] -15*w[2];
+   accm >>= 6;
+   w[0] = accm;
+
+   accm = accm + w[2] + w[1] + w[1];
+   w[2] = w[1];  w[1] = w[0];
+   
+   return accm;
+}
 
 //  6 constants.  a0 a1 a2    a0 a1 a2.  b1 is 2.0  b2 is 1.0
 //  6 time delay, 3 for each section, 8 bit inval
