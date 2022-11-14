@@ -1504,6 +1504,18 @@ static int8_t inrx, outrx;            // pipeline indexes
 }
 
 
+// 2 section butterworth, 2800hz  cutoff, 6793 hz sample rate 
+const int8_t k1bw[] = {               // a0 a1 a2, for butterworth b1 is always 2.0,  b2 is 1.0
+  (int8_t)( ( 0.693535  ) * 64.0 ),
+  (int8_t)( ( -1.147529  ) * 64.0 ),
+  (int8_t)( ( -0.347469  ) * 64.0 ),
+
+  (int8_t)( ( 0.693535 ) * 64.0 ),
+  (int8_t)( ( -1.418667  ) * 64.0 ),
+  (int8_t)( ( -0.665849  ) * 64.0 )
+  
+};
+
 
 // some non-interrupt rx processing,  will this work from loop(), added a pipeline as it fell behind
 // calc rx_val to be sent to PWM audio on the rx interrupt.  Hilbert phasing version
@@ -1516,6 +1528,7 @@ static int16_t agc = 1;
 static uint8_t agc_counter;       // fast agc with the uint8
 static int16_t q_delay[16];
 static int8_t quin;
+static int16_t wi[6],wq[6];
 
    noInterrupts();
    I = Ir[rxout];
@@ -1527,15 +1540,20 @@ static int8_t quin;
    // at 14 bits, need to go to 8 bits while keeping as many information bits as possible
    // impliment a 4 bit compressor, always drop 2 bits, bits are dropped in the CIC filter process
 
-   if( I > sig_level ) sig_level = I;                // peak signal detect, will be pulse noise sensitive
-   if( agc_counter == 0 ){
+   if( I > sig_level ) sig_level = I;                // peak signal detect
+   
+   if( ++agc_counter == 0 ){
       noInterrupts();        
-      if( sig_level > 96 && bits < 6  ) ++bits;          // 6 db steps makes small clicks on loud sigs, put attn on?
-      else if( sig_level < 40 && bits > 2 ) --bits;      // always drop 2 bits of the 14, just noise bits I think
+      if( sig_level > 96 && bits < 6  ) ++bits;           // 6 db steps makes small clicks on loud sigs, put attn on?
+      else if( sig_level < 40 && bits > 2 ) --bits;      // always drop 2 bits of the 14, just noise bits I think, 40
       sig_level = 0;
-      interrupts();      
+      interrupts();
+      if( agc < volume ) ++agc;     
    }
 
+   //I = IIR2BW8( I, k1bw, wi );            // !!!don't see how this will remove images and runs out of cpu
+   //Q = IIR2BW8( Q, k1bw, wq );
+   
    // need to be at 8 bits for hilbert processing
    tx_hilbert( I );                       // tx hilbert also used for RX
    //I = vali;
@@ -1547,14 +1565,10 @@ static int8_t quin;
    
    val *= agc;   // volume or agc
    val >>= 6;
-
-   ++agc_counter;
-   if( val > 2*volume ) --agc;               // volume ranges 0 to 63, signal +- 128
-   else if( agc_counter == 0 ){
-      if( agc < volume ) ++agc;
-   }
-
-   val = constrain( val + 128, 0, 255 );     // clip to 8 bits, zero offset for PWM
+   
+   if( val > 2*volume ) --agc;                  // volume ranges 0 to 63, signal +- 128
+   
+   val = constrain( val + 128, 0, 255 );             // clip to 8 bits, zero offset for PWM
 
    noInterrupts();
    rx_val[rxin] = (uint8_t)val;              // queue value to be sent to audio PWM during timer2 interrupt
@@ -1566,7 +1580,36 @@ static int8_t quin;
 
 
 // !!! probably should have a two section 8 bit butterworth for 1/4 sample rate cut off
-// !!! like the 3 section 10 bit special
+
+
+//  6 constants.  a0 a1 a2    a0 a1 a2.  b1 is 2.0  b2 is 1.0
+//  6 time delay, 3 for each section, 8 bit inval
+int16_t IIR2BW8( int16_t inval, int8_t k[], int16_t *w ){   // 2 section IIR butterworth
+int16_t accm;
+      
+   // w0 = a0*value + w1*a1 + w2*a2
+     accm = k[0]*inval + k[1]*w[1] + k[2]*w[2];
+     accm >>= 6;
+     *w = accm;
+     
+   // value = w0 + (w2)*b2 + (w1)*b1    and dmov the w terms ( terms backwards for the dmov TMS32xxxx )
+     accm = accm + w[2] + w[1] + w[1];     // b1 = 2, b2 = 1
+     *(w+2) = *(w+1);  *(w+1) = *w;
+
+     w += 3;      // second section
+
+        // w0 = a0*value + w1*a1 + w2*a2
+     accm = k[3]*inval + k[4]*w[1] + k[5]*w[2];
+     accm >>= 6;
+     *w = accm;
+
+   // value = w0 + (w2)*b2 + (w1)*b1    and dmov the w terms ( terms backwards for the dmov TMS32xxxx )
+     accm = accm + w[2] + w[1] + w[1];
+     *(w+2) = *(w+1);  *(w+1) = *w;
+    
+     return accm;
+}
+
 
 int16_t IIR2_8( int16_t inval, int8_t k[], int16_t *w ){     // 2 section IIR, 8 bit version, max values 128 * 64
 int16_t accm;
