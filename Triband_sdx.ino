@@ -20,9 +20,16 @@
  *     one ).  To try this program the process should be, load this program -> your OLED will not work.  Then add the 
  *     jumper wires.  To revert back you should remove the wires, then load the standard program.
  *     
- * RCL filter for audio out.   470 ohm, 100uh, 100n to ground.  Put inductor in series with the existing 470 ohm, and    
+ * RCL filter for audio out.   470 ohm, 100uh, 100n to ground.  Put the inductor in series with the existing 470 ohm, and    
  *     add the capacitor to ground on input or output side of the 10uf series capacitor.  
  *     The two pole filter should cut the 72khz PWM by 30 db.
+ *     I also put a 22 ohm resistor across the audio out jack.  A higher volume setting when using
+ *     a digital volume control means more bits are being used which should result in better fidelity.
+ *     
+ * I put in 4.7nf caps in the op-amp feedback.  I also have 47k resistors in place of 82k as I hadn't any 82k resistors on hand.   
+ *     The equivilent caps for 82k would be 2.7nf.  This change was to reduce the DSP alias signals.  An adjustable CIC compensation
+ *     filter is used to restore the lessened high audio frequencies. Adding these caps may have lessened the image rejection
+ *     of the receiver, perhaps some phase changes in the audio band of interest or the parts were not equal in value.
  * 
  * My process:  compile, AVRDudess, file in user/ron/local/appdata/temp/arduino_build_xxxxxx/, pickit 2 as programmer
  *  ? power up with pickit app to test ?  
@@ -168,6 +175,7 @@ uint8_t cal = 128;         // final frequency calibration +-500hz
 uint8_t Pmin = 0;
 uint8_t Pmax = 15;         // max is 63;
 uint8_t vox;
+uint8_t agc_on = 1;        // normally on, compile as zero to test image rejection
 
 //uint8_t dv;              // dummy var menu placeholder
 
@@ -197,6 +205,11 @@ uint8_t s_tone;                // sidetone independant of actual transmit condit
 volatile int     break_in;     // semi break in counter
 volatile int8_t  waveshape;    // cw wave shaping from sine cosine table
 
+// CIC filter compensation     FIR filter of length 3 with constants  -alpha/2,  alpha+1, -alpha/2
+uint8_t a_alpha = 5;
+int16_t a_plus1  = 96;
+int16_t a_by2    = 16;          // negative 16 when used
+
 
 #include "si5351_usdx.cpp"     // the si5351 code from the uSDX project, modified slightly for calibrate and RIT
 SI5351 si5351;
@@ -219,9 +232,9 @@ void setup() {
   digitalWrite( AUDIO_PIN, LOW );          // if thumps try the floating the pin as in timer1 startup notes
   pinMode( RX_EN, OUTPUT );
   pinMode( PTT, INPUT_PULLUP );            // pin 13, this is also DIT_PIN pin I think
-  pinMode( 12, INPUT );                    // has a 10k pullup, DAH_PIN I think, can swap as hardcoded the actual pin 12 here
-  pinMode( RELAY, OUTPUT );
-  digitalWrite(RELAY,LOW);
+  pinMode( 12, INPUT );                    // has a 10k pullup, DAH_PIN I think. 
+  pinMode( RELAY, OUTPUT );                // can swap the DIT_PIN, DAH_PIN defines if desired as hardcoded the actual pin 12 here
+  digitalWrite(RELAY,LOW);                 // the external amp relay
 
   i2init();
   LCD.InitLCD();
@@ -479,22 +492,91 @@ uint32_t  f;
 
 void display_freq(){
 int rem;
-//char priv[2];
 
-  // priv[0] = band_priv( freq );
-  // priv[1] = 0;
    rem = freq % 1000;
 
     // display big numbers in the blue area of the screen
     // font widths/height are: small 6 x 8, Medium 12 x 16, Big 14 x 24
     LCD.setFont(BigNumbers);
-    LCD.printNumI(freq/1000,5,ROW2,5,'/');
+    LCD.printNumI(freq/1000,12,ROW2,5,'/');
     LCD.setFont(MediumNumbers);
-    LCD.printNumI(rem,5*14 + 5 + 3,ROW3,3,'0');
+    LCD.printNumI(rem,5*14 + 12 + 3,ROW3,3,'0');
     LCD.setFont( SmallFont );                     // keep OLED in small text as the default font
     if( rit_enabled ) p_msg( msg2, 6 );           // RIT message
+    LCD.gotoRowCol( 3,0 );
+    LCD.putch( band_priv(freq));
  
 }
+
+//  USA: can we transmit here and what mode
+//  lower case for CW portions, upper case for phone segments
+//  X - out of band, E - Extra, A - Advanced class, G - General 
+char band_priv( uint32_t f ){
+char r = 'X';
+
+   f = f / 1000;
+   //else f = f / 100;                         // 60 meters, test 500hz steps
+          if( f >= 3500 && f <= 4000 ){
+             if( f < 3525 ) r = 'e';
+             else if( f < 3600 ) r = 'g';
+             else if( f < 3700 ) r = 'E';
+             else if( f < 3800 ) r = 'A';
+             else r = 'G';
+          }
+
+       /*    60 meters by 500 hz steps
+       case 1:
+          if( mode == USB || mode == DIGI ){
+             if( f == 53305 || f == 53465 || f == 53570 || f == 53715 || f == 54035 ) r = 'G';
+          }
+          if( mode == CW ){
+             if( f == 53320 || f == 53480 || f == 53585 || f == 53730 || f == 54050 ) r = 'g'; 
+          }
+       break;
+       */
+          if( f >= 7000 && f <= 7300 ){
+             if( f < 7025 ) r = 'e';
+             else if ( f < 7125 ) r = 'g';
+             else if ( f < 7175 ) r = 'A';
+             else r = 'G';
+          }
+
+          if( f >= 10100 && f <= 10150 ) r = 'g';
+
+          if( f >= 14000 && f <= 14350 ){
+             if( f < 14025 ) r = 'e';
+             else if( f < 14150 ) r = 'g';
+             else if( f < 14175 ) r = 'E';
+             else if( f < 14225 ) r = 'A';
+             else r = 'G';
+          }
+
+          if( f >= 18068 && f <= 18168 ){
+             if( f < 18110 ) r = 'g';
+             else r = 'G';
+          }
+
+          if( f >= 21000 && f <= 21450 ){
+             if( f < 21025 ) r = 'e';
+             else if( f < 21200 ) r = 'g';
+             else if( f < 21225 ) r = 'E';
+             else if( f < 21275 ) r = 'A';
+             else r = 'G';
+          }
+
+         if( f >= 24890 && f <= 24990 ){
+            if( f < 24930 ) r = 'g';
+            else r = 'G';
+         }
+
+         if( f >= 28000 && f <= 29700 ){
+            if( f < 28300 ) r = 'g';
+            else r = 'G';
+         }
+
+  return r;
+}
+
 
 
 /*****  Non-blocking  I2C  functions, interrupt driven  ******/
@@ -834,11 +916,12 @@ static uint8_t first_read;
 
 // simple menu with parallel arrays. Any values that do not fit in 0 to 255 will need to be scaled when used.
 // example map( var,0,255,-128,127)
-#define NUM_MENU 12
-const char smenu[] PROGMEM = "Vol AttnBandModeKSpdKmdeSvolBdlyCal PminPmaxVox ";      // pad spaces out to multiple of 4 fields
-uint8_t *svar[NUM_MENU] = {&volume,&attn,&band,&mode,&kspeed,&kmode,&side_vol,&bdelay,&cal,&Pmin,&Pmax,&vox};
-uint8_t  smax[NUM_MENU] = {  63,   3,    2,     2,     25,    7,     63,       100,   254,   20,    63,  1 };
-uint32_t stripee = 0b00000000000000000000011100100000;                         // bit set for strip menu items to save in eeprom
+#define NUM_MENU 13
+                         // pad with spaces out to multiple of 4 fields
+const char smenu[] PROGMEM = "Vol AttnBandModeKSpdKmdeSvolBdlyCal PminPmaxVox Tone            ";
+uint8_t *svar[NUM_MENU] = {&volume,&attn,&band,&mode,&kspeed,&kmode,&side_vol,&bdelay,&cal,&Pmin,&Pmax,&vox,&a_alpha};
+uint8_t  smax[NUM_MENU] = {  63,   3,    2,     2,     25,    7,     63,       100,   254,   20,   63,  1,   20 };
+uint32_t stripee = 0b00000000000000000000011110100000;           // set corresponding bit for strip menu items to save in eeprom
 
 // note: a smax value of 255 will not be restored from eeprom, it looks like erased data.
 //       smax of 1 allows two values for the variable.  Max for band (2) is 3 bands 0,1,2
@@ -883,13 +966,13 @@ static uint8_t hyper;
        encoder_user = FREQ_U;              // encoder now changes frequency
    }
 
-   if( (command == 2 || command == 4) && ed ) strip_post( sel );
+   if( (command == 2 || command == 4) && ed ) strip_post( sel );      // impliment changes 
   
 }
 
 // print 4 strings and values from somewhere in the strip menu text, offset will be a page number or group of 4
 const char mode_str[] PROGMEM = "CW USBLSB";
-const char keyer_str[] PROGMEM = " S  A  B Ult S swAswBswU";
+const char keyer_str[] PROGMEM = " S  A  B Ult S swAswBswU";            // modes and paddle switched modes
 void strip_display( uint8_t offset, uint8_t sel, uint8_t ed ){
 int i,k;
 uint8_t val;
@@ -914,7 +997,7 @@ uint8_t val;
           LCD.gotoRowCol(1,i*6*5);
           for( k = 0; k < 3; ++k ) LCD.putch( pgm_read_byte( &mode_str[3*mode+k] ));
        }
-       else if( offset == 1 && i == 2 ){         // text for keyer modes and swapped paddles modes
+       else if( offset == 1 && i == 1 ){         // text for keyer modes and swapped paddles modes
           LCD.gotoRowCol( 1, i*6*5 );
           for( k = 0; k < 3; ++k ) LCD.putch( pgm_read_byte( &keyer_str[3*kmode+k] ));
        }
@@ -930,9 +1013,10 @@ int i;
 
    // LCD.clrRow( 6 );             // help message area
    // LCD.gotoRowCol( 6,0 );       // having this here with no writes to follow causes a program hang
-                                   // OLED left in command mode ?  goto is one of my "enhancements" to the library.
+                                   // OLED left in command mode?  goto is one of my "enhancements" to the library.
    
    switch( sel ){
+      case 1:  digitalWrite( RX_EN, ( attn & 2 ) ? LOW : HIGH );   break;
       case 2:                      // band change
         bandstack[oldband] = freq;
         freq = bandstack[band];
@@ -940,8 +1024,13 @@ int i;
         p_msg( msg1, 6 );          // Check band switches message
         tx_inhibit = 1;
       //break;
-      case 3: rit_enabled = 0;  qsy(0);  break;    // mode change.  clear RIT or Si5351 will not be reset to new dividers
+      case 3:                      // mode change.  clear RIT or Si5351 will not be reset to new dividers
+         rit_enabled = 0;
+         set_timer2( RX );         // different sample rate for CW mode
+         qsy(0);
+         break;
       case 8:  qsy(0);  break;                     // calibrate, implement freq change for user observation
+      case 12:  calc_CIC();  break;                // Tone control is the CIC compensation filter parameters
    }
    if( stripee & ( 1 << sel ) ) eeprom_write_pending = 62000;   // 62 quick seconds until eeprom write
   
@@ -967,13 +1056,23 @@ uint8_t val;
          if( val != 0xff ){
             if( val > smax[i] ){      // eeprom not valid, maybe some changes were made to the menu
                 p_msg( msg5, 6 );
-                delay(5000);          // message will be overwritten in 5 seconds
+                LCD.printNumI( i, RIGHT, ROW6 ); 
+                delay(8000);          // message will be overwritten 
                 return;               // abort restore
             }
             *svar[i] = val;
          }
       }
    }
+}
+
+void calc_CIC(){                      // calculate the constants for the CIC compensation filter.  In Q6 format.
+float a;
+
+   a = (float)a_alpha / 10.0;
+   a_plus1 = 64.1 * ( 1.0 + a );
+   a = a / 2.0;
+   a_by2 = 64.1 * a;
 }
 
 /*******************  end menu *********************/
@@ -983,13 +1082,14 @@ uint8_t val;
 int8_t read_paddles(){                    // keyer and/or PTT function
 int8_t pdl;
 
-   pdl = digitalRead( DAH_PIN ) ? 2 : 0;
-   pdl += digitalRead( DIT_PIN ) ? 1 : 0;
+   pdl = 0;
+   if( digitalRead( DAH_PIN ) == LOW ) pdl = 2;
+   if( digitalRead( DIT_PIN ) == LOW ) pdl += 1;
    
-   if( (kmode & 4) && mode == CW  ){                        // swap paddles 
+   if( kmode & 4 ){                        // swap paddles 
       pdl <<= 1;
       if( pdl & 4 ) pdl += 1;
-      pdl &= 3;                                             // wire straight key to ring of plug
+      pdl &= 3;                            // wire straight key to ring of plug
    }
 
    return pdl;
@@ -1140,20 +1240,23 @@ void set_timer1( uint8_t clk ){                // timer 1 is set for 8 bit fixed
    interrupts();
 }
 
-void set_timer2( int8_t mode){
+void set_timer2( int8_t timer_mode){
 
   noInterrupts();
   TCCR2B = 0;                        // stop
   TCNT2 = 0;                         // clear counter
   PRR &= ~(1 << PRTIM2 );            // powered up
   TCCR2A = 2;                        // CTC mode
-  TIMSK2 = mode;                     // enable interrupts A match or B match, RX TX defines
+  TIMSK2 = timer_mode;               // enable interrupts A match or B match, RX TX defines
                                      // OCR2A = (F_CPU / pre-scaler / fs) - 1;
-                                     // actual fs = f_fcu / ( N * (1 + OCR2A ))
-  if( mode == RX ) OCR2A = 51;       // count to value, resets, interrupts, fs = 48077:51  54347:45
-  if( mode == TX ) OCR2A = 222;      // fs = 11210 int rate,  5605 tx update rate, if change here then change _UA
-  OCR2B = OCR2A - 1;                 // use the 2nd interrupt for transmit
-  TCCR2B = 2;                        // start clocks, divide by 8 clock prescale
+                                           // actual fs = f_fcu / ( N * (1 + OCR2A ))
+  if( timer_mode == RX ){
+     if( mode == CW ) OCR2A = 62;          // 40000, actual is 39682, slower for cw as out of cpu
+     else OCR2A = 51;                      // count to value, resets, interrupts, fs = 48077:51  54347:45
+  }
+  if( timer_mode == TX ) OCR2A = 222;      // fs = 11210 int rate,  5605 tx update rate, if change here then change _UA
+  OCR2B = OCR2A - 1;                       // use the 2nd interrupt for transmit
+  TCCR2B = 2;                              // start clocks, divide by 8 clock prescale
   interrupts();
 }
 
@@ -1201,9 +1304,11 @@ int inv;
   
 }
 
-// a 31 tap classic hilbert every other constant is zero, kaiser window
+
 int16_t valq, vali;                                 // results of hilbert filter are global
 
+/*
+// a 31 tap classic hilbert every other constant is zero, kaiser window
 void tx_hilbert( int16_t val ){
 static int16_t wi[31];                              // delay terms
 int16_t t;
@@ -1218,6 +1323,8 @@ const int16_t k6 = (int16_t)( 256.5 * 0.195583262432201366 );      //           
 const int16_t k7 = (int16_t)( 256.5 * 0.629544595185021816 );      //
 
     val = constrain(val,-128,127);                     // avoid overflow, tx clipper
+                                                       // !!! but when used for RX it clips I but not Q
+                                                       // and scaling by clipping not valid as I and Q are out of phase
    // think it will handle 7 bits in with the adjustment on k7 multiply
    for( int i = 0; i < 30; ++i )  wi[i] = wi[i+1];
    wi[30] = val;
@@ -1230,9 +1337,29 @@ const int16_t k7 = (int16_t)( 256.5 * 0.629544595185021816 );      //
    t = k7 * ((wi[14] - wi[16]));
    vali += (t >> 8);
 }
+*/
 
 
+// 19 tap classic hilbert, no window, also used for RX
+void tx_hilbert( int16_t val ){
+const int16_t k0 = (int16_t)( 256.0 * 0.064724396357330738 );
+const int16_t k1 = (int16_t)( 256.0 * 0.083217089189936755 );
+const int16_t k2 = (int16_t)( 256.0 * 0.116503933432949208 );
+const int16_t k3 = (int16_t)( 256.0 * 0.194173231907191046 );
+const int16_t k4 = (int16_t)( 256.0 * 0.582519710000210189 );
+static int16_t w[19];
+uint8_t i;
+int16_t t;
 
+    for( int i = 0; i < 18; ++i )  w[i] = w[i+1];
+    w[18] = val;
+    valq = w[9];
+
+    vali = k0 * ( w[0] - w[18] ) + k1 * ( w[2] - w[16] ) + k2 * ( w[4] - w[14] ) + k3 * ( w[6] - w[12] );  //+ k4 * ( w[8] - w[10] );
+    vali >>= 8;
+    t = k4 * ( w[8] - w[10] );
+    vali += (t >> 8);
+}
 
 #define TX_REF (0x40 | 0x80)                 // 1.1 volt reference
 #define _UA   5605                           // make same as sample rate
@@ -1400,7 +1527,8 @@ int16_t s;
 //  try 1400 lowpass/bfo and phase update of 15.  5973 sample rate, 23893 effective sample rate, 47786 interrupt rate
 
 
-uint8_t bits = 4;                      // agc bits          
+uint8_t bits = 6;                      // agc bits.  If compile as no-agc then get 10 bits out of the CIC filter. 
+                                       // use the attenuator to avoid overload during testing       
 
 
 void rx_process(){
@@ -1507,18 +1635,6 @@ static int8_t inrx, outrx;            // pipeline indexes
 }
 
 
-// 2 section butterworth, 2800hz  cutoff, 6793 hz sample rate 
-const int8_t k1bw[] = {               // a0 a1 a2, for butterworth b1 is always 2.0,  b2 is 1.0
-  (int8_t)( ( 0.693535  ) * 64.0 ),
-  (int8_t)( ( -1.147529  ) * 64.0 ),
-  (int8_t)( ( -0.347469  ) * 64.0 ),
-
-  (int8_t)( ( 0.693535 ) * 64.0 ),
-  (int8_t)( ( -1.418667  ) * 64.0 ),
-  (int8_t)( ( -0.665849  ) * 64.0 )
-  
-};
-
 
 // some non-interrupt rx processing,  will this work from loop(), added a pipeline as it fell behind.
 // calc rx_val to be sent to PWM audio on the rx interrupt.  Hilbert phasing version
@@ -1532,7 +1648,8 @@ static int16_t agc = 1;
 static uint8_t agc_counter;       // fast agc with the uint8
 static int16_t q_delay[16];
 static int8_t quin;
-static int16_t wi[6],wq[6];
+//static int16_t wi[6],wq[6];
+
 
    noInterrupts();
    I = Ir[rxout];
@@ -1546,33 +1663,34 @@ static int16_t wi[6],wq[6];
 
    if( I > sig_level ) sig_level = I;                    // peak signal detect
    
-   if( ++agc_counter == 0 ){
+   if( ++agc_counter == 0 && agc_on ){
       noInterrupts();        
-      if( sig_level > 96 && bits < 8  ) ++bits;          // 6 db steps makes small clicks on loud sigs, put attn on?
-      else if( sig_level < 40 && bits > 4 ) --bits;      // always drop 4 bits of the 16, just noise bits I think, 40
+      if( sig_level > 96 && bits < 8  ) ++bits;             // 6 db steps makes small clicks on loud sigs, put attn on?
+      else if( sig_level < 40 && bits > 4 ) --bits;         // always drop 4 bits of the 16, just noise bits I think
       sig_level = 0;
       interrupts();
-      if( agc < volume ) ++agc;     
+      if( bits <= 4 && agc < ( volume+volume ) ) ++agc;     // small signal boost
+      else if( agc < volume ) ++agc;     
    }
-
-   //I = IIR2BW8( I, k1bw, wi );            // !!!don't see how this will remove images and runs out of cpu
-   //Q = IIR2BW8( Q, k1bw, wq );
    
    // need to be at 8 bits for hilbert processing
    tx_hilbert( I );                       // tx hilbert also used for RX
    //I = vali;
    q_delay[quin] = Q;                     // circular delay buffer
-   quin = (quin+1) & 15;
+   //quin = (quin+1) & 15;                // for length 31 hilbert
+   if( ++quin > 9 ) quin = 0;             // delay for length 19 hilbert
    //Q = q_delay[quin];
 
    val = vali - q_delay[quin];            // val = I - Q; 
-   
-   val *= agc;   // volume or agc
+
+   if( mode == CW ) val = FIRcw( val );              // bandpass 
+   else val = CIC_comp( val );                       // peak higher freqs
+
+   if( agc_on ) val *= agc;
+   else val *= volume;
    val >>= 6;
-   
    if( val > 2*(int)volume ) --agc;                  // volume ranges 0 to 63, signal +- 128
-   if( mode == CW ) val = IIRcw8( val );
-   
+      
    val = constrain( val + 128, 0, 255 );             // clip to 8 bits, zero offset for PWM
 
    noInterrupts();
@@ -1584,6 +1702,87 @@ static int16_t wi[6],wq[6];
 }
 
 
+// CIC compensation: -Alpha/2, 1 + Alpha, -Alpha/2  3 tap FIR.
+int16_t CIC_comp( int16_t val ){
+static int16_t a,b,c;
+
+   a = b;  b = c; c = val;
+   val = a_plus1*b - a_by2*( a + c );
+   return ( val >> 6 ); 
+}
+
+
+
+
+
+// length 15 padded to 16
+// sr  5000 or 6000
+const int8_t k_cw[16] =  {
+   (int8_t)(-0.026331 * 64),
+   (int8_t)(-0.020283 * 64),
+   (int8_t)(-0.047333 * 64),
+   (int8_t)(-0.097973 * 64),
+   (int8_t)(-0.084384 * 64),
+   (int8_t)(0.057563 * 64),
+   (int8_t)(0.257407 * 64),
+   (int8_t)(0.352667 * 64),
+   (int8_t)(0.257407 * 64),
+   (int8_t)(0.057563 * 64),
+   (int8_t)(-0.084384 * 64),
+   (int8_t)(-0.097973 * 64),
+   (int8_t)(-0.047333 * 64),
+   (int8_t)(-0.020283 * 64),
+   (int8_t)(-0.026331 * 64),
+      0
+      }; 
+
+
+// FIR bandpass center 600 hz
+// out of cpu when using the menu, changed to lower sample rate for CW mode
+int16_t FIRcw( int16_t inval ){
+static int16_t w[16];
+int i,k;
+static int8_t in;
+int16_t accm;
+
+   w[in] = inval;
+   in = (in +1) & 15;
+   
+   accm = 0;
+   k = in;
+
+   for( i = 0; i < 16; ++i ){
+      accm += k_cw[i] * w[k];
+      k = (k+1) & 15;
+   }
+   return (accm >> 6); 
+}
+
+/*
+//  Cheby bandpass 300 - 900 at 6000 sr, .3 ripple 30 db
+//  This filter oscillates sometimes.
+int16_t IIRcw8( int16_t inval ){
+static int16_t w[6];
+int32_t accm;
+
+   accm = 21*inval + 48*w[1] - 30*w[2];
+   accm >>= 6;
+   w[0] = constrain(accm,-32000,32000);
+
+   accm = accm + w[2] + w[1] + w[1];
+   w[2] = w[1];  w[1] = w[0];
+
+   accm = 10*accm + 110*w[4] - 51*w[5];
+   accm >>= 6;
+   w[3] = constrain(accm,-32000,32000);
+
+   accm = accm + w[5] - w[4] - w[4];
+   w[5] = w[4];   w[4] = w[3];
+   return accm;
+}
+*/
+
+/*
 int16_t IIRcw8( int16_t inval ){
 static int16_t w[3];
 int16_t accm;
@@ -1597,7 +1796,9 @@ int16_t accm;
    
    return accm;
 }
+*/
 
+/*
 //  6 constants.  a0 a1 a2    a0 a1 a2.  b1 is 2.0  b2 is 1.0
 //  6 time delay, 3 for each section, 8 bit inval
 int16_t IIR2BW8( int16_t inval, int8_t k[], int16_t *w ){   // 2 section IIR butterworth
@@ -1625,8 +1826,8 @@ int16_t accm;
     
      return accm;
 }
-
-
+*/
+/*
 int16_t IIR2_8( int16_t inval, int8_t k[], int16_t *w ){     // 2 section IIR, 8 bit version, max values 128 * 64
 int16_t accm;
 
@@ -1655,7 +1856,7 @@ int16_t accm;
 
      return accm;
 }
-
+*/
 
 #ifdef I2STATS
  void print_i2stats(){
@@ -2091,4 +2292,18 @@ long accm;
      return (int16_t)accm;
 }
 
+*/
+
+/*
+// 2 section butterworth, 2800hz  cutoff, 6793 hz sample rate 
+const int8_t k1bw[] = {               // a0 a1 a2, for butterworth b1 is always 2.0,  b2 is 1.0
+  (int8_t)( ( 0.693535  ) * 64.0 ),
+  (int8_t)( ( -1.147529  ) * 64.0 ),
+  (int8_t)( ( -0.347469  ) * 64.0 ),
+
+  (int8_t)( ( 0.693535 ) * 64.0 ),
+  (int8_t)( ( -1.418667  ) * 64.0 ),
+  (int8_t)( ( -0.665849  ) * 64.0 )
+  
+};
 */
