@@ -7,7 +7,7 @@
  *        In theory we may achieve a higher tx sampling rate than otherwise.
  *     Distributed receive processing with pipelined data flow.    
  *        In theory we will have more time to process more complicated receive algorithms.
- *     Good looking display layout.
+ *     Able to use a library for the screen with some nice numeric fonts.
  * 
  * !!! Hardware mods.  The Si5351 module was NOT converted to run 3.3 volts I2C signals. 
  *     Jumpered pin 27 to 4 and 28 to 5 to get I2C signals to the OLED.
@@ -40,6 +40,7 @@
  *   Select: Tap opens menu, another Tap enables edit , DTap opens menu in edit mode, Long Press qsy's -100kc
  *   Exit  : Tap backs out of menu one step, DTap backs out all the way, Long Press qsy's +100kc
  *           Also used to enable TX after a band change and to exit from RIT.
+ *           Also turns on the S meter.
  *   Encoder: Long Press opens Volume directly for edit.
  *            Tap changes tuning step 
  *            Dtap  ( unassigned )
@@ -203,8 +204,7 @@ uint8_t tx_inhibit = 1;        // start with a band switches check message befor
 uint8_t s_tone;                // sidetone independant of actual transmit condition
 volatile int     break_in;     // semi break in counter
 volatile int8_t  waveshape;    // cw wave shaping from sine cosine table
-uint8_t msg_on;
-int16_t gagc;                  // global copy for s meter
+uint8_t menu_on = 1;
 
 // CIC filter compensation     FIR filter of length 3 with constants  -alpha/2,  alpha+1, -alpha/2
 uint8_t a_alpha = 5;
@@ -221,6 +221,7 @@ const char msg3[] PROGMEM = "SDX TriBander";
 const char msg4[] PROGMEM = "K1URC wb2cba pe1nnz";
 const char msg5[] PROGMEM = "EEPROM ? Check vars";
 
+int16_t  agc;                          // made variable global for the s meter
 uint8_t bits = 6;                      // agc bits.  If compile as no-agc then get 10 bits out of the CIC filter. 
                                        // use the attenuator to avoid overload during testing       
 
@@ -275,14 +276,14 @@ char c;
    LCD.gotoRowCol( row, 0 );
    while( ( c = pgm_read_byte(ptr++) ) ) LCD.putch(c);
    LCD.putch(' ');                      // make sure at least one write after gotoRowCol
-   if( row == 6 ) msg_on = 1;
   
 }
 
 void loop() {
 static unsigned long tm;
 static unsigned int sec;
-static uint8_t robin;          // round robin some processing, not sure this is needed
+static uint8_t robin;          // round robin some processing
+static uint8_t max_bits;
 int t;
 
  // high priority.
@@ -329,9 +330,13 @@ int t;
         if( --eeprom_write_pending == 0 ) strip_save();
      }
 
-     if( (sec & 255) == 255 ) smeter( bits, gagc );
-     if( ++sec == 15000 ){      // debug printing each 15 seconds, added smeter call
-
+     if( bits > max_bits ) max_bits = bits;             // peak reading s meter
+     if( (sec & 255) == 255 ){                          // call 4 times a second to update meter
+         smeter( max_bits, agc );
+         max_bits = 0;
+     }
+     
+     if( ++sec == 15000 ){                              // printing debug counters each 15 seconds
         sec = 0;
         #ifdef I2STATS
           print_i2stats();
@@ -929,6 +934,19 @@ static uint8_t ed;
 static uint8_t mode;   // 0 not active, 1 select var, 2 edit var
 static uint8_t hyper;
 
+   if( command == 3 && mode == 0 ){         // exit when not needed, clear out some latched on functions
+      LCD.clrRow(6);
+      tx_inhibit = 0;                                 // enable transmit
+      if( rit_enabled ){                              // cancel RIT
+         rit_enabled = 0;                             // returns to rx freq as we don't save the tx freq, just in si5351 registers
+         freq = freq - freq % step_;                  // clear out LSDigits
+         qsy(0);
+      }
+      menu_on = 0;                                    // enable S meter display
+      return;
+   }
+
+   
    // slow down encoder inputs
    hyper ^= 1;
    if( hyper && (command == 2 || command == 4) ) return;   // half speed encoder
@@ -949,19 +967,6 @@ static uint8_t hyper;
    }
 
    // commands common to all modes.  mode here is menu mode and not the radio mode.
-
-   if( command == 3 && mode == 0 ){         // exit when not needed, clear out some latched on functions
-      if( msg_on ){
-         LCD.clrRow(6);                               // clear help message
-         msg_on = 0;
-      }
-      tx_inhibit = 0;                                 // enable transmit
-      if( rit_enabled ){                              // cancel RIT
-         rit_enabled = 0;                             // returns to rx freq as we don't save the tx freq, just in si5351 registers
-         freq = freq - freq % step_;                  // clear out LSDigits
-         qsy(0);
-      }
-   }
    
    if( command == 1 && mode < 2 ) ++mode;
    if( command == 3 && mode != 0 ) --mode;
@@ -970,8 +975,9 @@ static uint8_t hyper;
    if( mode ){
        strip_display(sel>>2, sel, ed );    // menu active
        encoder_user = MENU_U;
+       menu_on = 1;                        // sharing screen space with the s meter
    }
-   else{
+   else if( menu_on ){
        strip_display( sel>>2, 0xff, 0 );   // display menu with no inverse text
        encoder_user = FREQ_U;              // encoder now changes frequency
    }
@@ -1645,17 +1651,17 @@ static int8_t inrx, outrx;            // pipeline indexes
 
 // some non-interrupt rx processing,  will this work from loop(), added a pipeline as it fell behind.
 // calc rx_val to be sent to PWM audio on the rx interrupt.  Hilbert phasing version
-// hear some images out of the CIC filter, at delta 24k 48k,  increased the length to 3.
+// heard some images out of the CIC filter, at delta 24k 48k,  increased the length to 3.
 void rx_process2(){
 int val;
 static uint8_t rxout, rxin;
 int I,Q;
 static int16_t sig_level; 
-static int16_t agc = 1;
+//static int16_t agc = 1;         // changed variable to a global
 static uint8_t agc_counter;       // fast agc with the uint8
+static uint8_t agc_recover;
 static int16_t q_delay[16];
 static int8_t quin;
-//static int16_t wi[6],wq[6];
 
 
    noInterrupts();
@@ -1672,14 +1678,15 @@ static int8_t quin;
    
    if( ++agc_counter == 0 && agc_on ){
       noInterrupts();        
-      if( sig_level > 96 && bits < 8  ) ++bits;             // 6 db steps makes small clicks on loud sigs, put attn on?
-      else if( sig_level < 40 && bits > 4 ) --bits;         // always drop 4 bits of the 16, just noise bits I think
+      if( sig_level > 96 && bits < 8  ) ++bits;             // 6 db agc steps 
+      else if( sig_level < 40 && bits > 4 ){                // always drop 4 bits of the 16, just noise bits I think
+         if( ++agc_recover == 4 ) --bits, agc_recover = 0;  // slower recover than attack
+      }
       sig_level = 0;
       interrupts();
       if( bits <= 4 && agc < ( volume+volume ) ) ++agc;     // small signal boost
       else if( agc < volume ) ++agc;
       // smeter( bits, agc );                               // crash, recursive, need to call from loop
-      gagc = agc;                                           // a global copy of agc for the s meter
    }
    
    // need to be at 8 bits for hilbert processing
@@ -1772,13 +1779,13 @@ void smeter( uint8_t db, int16_t agc ){
 static int8_t bars;
 int8_t b,i,k;
 
-      if( msg_on ){
+      if( menu_on ){
         bars = 0;
-        return;                   // screen area used by a message
+        return;                   // screen area used by the menu
       }
       
       // how many bars to show, 6db steps
-      b = 2;
+      b = 1;
       if( attn & 1 ) b += 2;
       b += ( db - 4 );
       //if( agc >= 2*volume ) --b;
@@ -1791,21 +1798,22 @@ int8_t b,i,k;
       // just display or erase what is needed
 
       if( bars == 0 ){
-         LCD.gotoRowCol( 6, 0 );
-         LCD.putch(' ');
+         LCD.clrRow(0,0,60);
+         LCD.clrRow(1,0,60);
+         LCD.gotoRowCol( 1, 0 );
          LCD.putch('S');
          LCD.write(0);
       }
 
       if( b > bars ){                        // write new bars
-         LCD.gotoRowCol( 6, 14 + 4 + 4*bars );
-         k = 0x80;
+         LCD.gotoRowCol( 1, 8 + 4*bars );
+         k = 0xc0;
          for( i = 1; i < bars; ++i ){
             k >>= 1;
             k |= 0x80;
             if( k == 0xff ) break;
          }
-         for( i = bars; i <= b; ++i ){
+         for( i = bars; i < b; ++i ){
             LCD.write(k,3);
             LCD.write(0);
             if( k != 0xff ){                 // grow size of the s meter bars
@@ -1815,13 +1823,11 @@ int8_t b,i,k;
          }
       }
       else{                                  // erase
-         b = bars - 1;                       // slow decay, but agc is actually very fast
-         LCD.gotoRowCol( 6, 14 + 4 + 4*b );
-         for( i = b; i <= bars; ++i ){
-             LCD.write(0,4);
-         }
+         b = bars - 1;                       // erase just one bar
+         LCD.gotoRowCol( 1, 8 + 4*b );     
+         LCD.write(0,4);
       }
-      //LCD.putch(' ');
+      
       bars = b;
       LCD.printNumI( bars, RIGHT, ROW6 );
 
@@ -1829,7 +1835,7 @@ int8_t b,i,k;
 
 /*
 //  Cheby bandpass 300 - 900 at 6000 sr, .3 ripple 30 db
-//  This filter oscillates sometimes.
+//  This filter oscillates sometimes when receive sudden increase in signal
 int16_t IIRcw8( int16_t inval ){
 static int16_t w[6];
 int32_t accm;
