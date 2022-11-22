@@ -26,10 +26,7 @@
  *     I also put a 22 ohm resistor across the audio out jack.  A higher volume setting when using
  *     a digital volume control means more bits are being used which should result in better fidelity.
  *     
- * I put in 4.7nf caps in the op-amp feedback.  I also have 47k resistors in place of 82k as I hadn't any 82k resistors on hand.   
- *     The equivilent caps for 82k would be 2.7nf.  This change was to reduce the DSP alias signals.  An adjustable CIC compensation
- *     filter is used to restore the lessened high audio frequencies. Adding these caps may have lessened the image rejection
- *     of the receiver, perhaps some phase changes in the audio band of interest or the parts were not equal in value.
+ * I put in 2.2nf caps in the op-amp feedback.  I also have 47k resistors in place of 82k as I hadn't any 82k resistors on hand.   
  * 
  * My process:  compile, AVRDudess, file in user/ron/local/appdata/temp/arduino_build_xxxxxx/, pickit 2 as programmer
  *  ? power up with pickit app to test ?  
@@ -115,7 +112,8 @@ extern unsigned char BigNumbers[];
 
 #define CW  0
 #define USB 1
-#define LSB 2  
+#define LSB 2
+#define AM  3 
 
 #define I2TBUFSIZE 32              // size power of 2.  max 256 as using 8 bit index
 #define I2RBUFSIZE 2               // set to expected #of reads, power of 2.  Won't be doing any reads in this program.
@@ -175,7 +173,7 @@ uint8_t cal = 128;         // final frequency calibration +-500hz
 uint8_t Pmin = 0;
 uint8_t Pmax = 15;         // max is 63;
 uint8_t vox;
-uint8_t agc_on = 1;        // normally on, compile as zero to test image rejection
+uint8_t agc_on = 1;        // normally on, turn off to test image rejection
 
 //uint8_t dv;              // dummy var menu placeholder
 
@@ -223,8 +221,21 @@ const char msg5[] PROGMEM = "EEPROM ? Check vars";
 
 int16_t  agc;                          // made variable global for the s meter
 uint8_t bits = 6;                      // agc bits.  If compile as no-agc then get 10 bits out of the CIC filter. 
-                                       // use the attenuator to avoid overload during testing       
+                                       // use the attenuator to avoid overload during testing
 
+// Direct form 1 IIR filters, constants in b0,b1,b2,a1,a2 order, 2 sections
+const int8_t filters[7][10] PROGMEM = {
+   {  64, 0, 0, 0, 0, 64, 0, 0, 0, 0 },                  // passthrough SSB
+   { 0 },
+   { 0 },
+   { -19, 0, 19, -101, 47,  -14, 0, 14, -61, 36 },       // CW wide
+   { 0 },
+   { 0 },
+   { 57, -58, 57, -69, 51,  55, -54, 55, -43, 49}        // AM notch at 1kc
+};
+int8_t  kf[10] = {  64, 0, 0, 0, 0, 64, 0, 0, 0, 0 };    // default as passthrough
+int16_t wi[6], wo[6];                                    // delay terms for the IIR filter
+uint8_t filter;                                          // chosen filter ( menu item
 
 
 void setup() {
@@ -917,16 +928,18 @@ static uint8_t first_read;
 
 // simple menu with parallel arrays. Any values that do not fit in 0 to 255 will need to be scaled when used.
 // example map( var,0,255,-128,127)
-#define NUM_MENU 13
+#define NUM_MENU 15
                          // pad with spaces out to multiple of 4 fields
-const char smenu[] PROGMEM = "Vol AttnBandModeKSpdKmdeSvolBdlyCal PminPmaxVox Tone            ";
-uint8_t *svar[NUM_MENU] = {&volume,&attn,&band,&mode,&kspeed,&kmode,&side_vol,&bdelay,&cal,&Pmin,&Pmax,&vox,&a_alpha};
-uint8_t  smax[NUM_MENU] = {  63,   3,    2,     2,     25,    7,     63,       100,   254,   20,   63,  1,   20 };
+const char smenu[] PROGMEM = "Vol AttnBandModeKSpdKmdeSvolBdlyCal PminPmaxVox ToneAGC Filt    ";
+uint8_t *svar[NUM_MENU] = {&volume,&attn,&band,&mode,&kspeed,&kmode,&side_vol,&bdelay,&cal,&Pmin,&Pmax,&vox,&a_alpha,&agc_on,&filter};
+uint8_t  smax[NUM_MENU] = {  63,   3,    2,     3,     25,    7,     63,       100,   254,   20,   63,  1,   20,      1,        2 };
 uint32_t stripee = 0b00000000000000000000011110100000;           // set corresponding bit for strip menu items to save in eeprom
 
 // note: a smax value of 255 will not be restored from eeprom, it looks like erased data.
 //       smax of 1 allows two values for the variable.  Max for band (2) is 3 bands 0,1,2
 //       the zero value for cal is 128 allowing both pos and neg frequency calibration
+
+
 // commands: 2,4 encoder, 0 reset entry, 1 select, 3 exit
 void strip_menu( int8_t command ){        
 static uint8_t sel;
@@ -987,10 +1000,10 @@ static uint8_t hyper;
 }
 
 // print 4 strings and values from somewhere in the strip menu text, offset will be a page number or group of 4
-const char mode_str[] PROGMEM = "CW USBLSB";
+const char mode_str[] PROGMEM = "CW USBLSBAM ";
 const char keyer_str[] PROGMEM = " S  A  B Ult S swAswBswU";            // modes and paddle switched modes
 void strip_display( uint8_t offset, uint8_t sel, uint8_t ed ){
-int i,k;
+uint8_t i,k;
 uint8_t val;
 
    if( ed == 0 ){                                  // skip extra OLED writes, ed mode only changes numbers
@@ -1044,9 +1057,12 @@ int i;
          rit_enabled = 0;
          set_timer2( RX );         // different sample rate for CW mode
          qsy(0);
+         load_filter();
          break;
       case 8:  qsy(0);  break;                     // calibrate, implement freq change for user observation
       case 12:  calc_CIC();  break;                // Tone control is the CIC compensation filter parameters
+      case 13:  bits = 8;  break;                  // agc off or on, set agc compression to max
+      case 14: load_filter(); break;
    }
    if( stripee & ( 1 << sel ) ) eeprom_write_pending = 62000;   // 62 quick seconds until eeprom write
   
@@ -1089,6 +1105,20 @@ float a;
    a_plus1 = 64.1 * ( 1.0 + a );
    a = a / 2.0;
    a_by2 = 64.1 * a;
+}
+
+void load_filter(){                 // copy filter constants from flash to ram
+uint8_t f,c;
+uint8_t i;
+
+   f = filter;                      // set for SSB filters
+   if( mode == AM ) f = 6;
+   if( mode == CW ) f += 3;
+
+   noInterrupts();
+   for( i = 0; i < 10; ++i ) kf[i] = pgm_read_byte( &filters[f][i] );
+   interrupts();
+  
 }
 
 /*******************  end menu *********************/
@@ -1647,6 +1677,12 @@ static int8_t inrx, outrx;            // pipeline indexes
   
 }
 
+// !!! find a good place to put filter constants, maybe at the very top with all else
+//   k[mode == CW ? 0:1 ][filter#][consts]
+//int8_t kcw[10] = { -19, 0, 19, -101, 47,  -14, 0, 14, -61, 36 };   // 2 sections of b0,b1,b2,a1,a2
+//int8_t kam[10] = { 57, -58, 57, -69, 51,  55, -54, 55, -43, 49};   // am notch at 1kc
+//int16_t wi[6], wo[6];
+
 
 
 // some non-interrupt rx processing,  will this work from loop(), added a pipeline as it fell behind.
@@ -1688,24 +1724,45 @@ static int8_t quin;
       else if( agc < volume ) ++agc;
       // smeter( bits, agc );                               // crash, recursive, need to call from loop
    }
-   
-   // need to be at 8 bits for hilbert processing
-   tx_hilbert( I );                       // tx hilbert also used for RX
-   //I = vali;
-   q_delay[quin] = Q;                     // circular delay buffer
-   //quin = (quin+1) & 15;                // for length 31 hilbert
-   if( ++quin > 9 ) quin = 0;             // delay for length 19 hilbert
-   //Q = q_delay[quin];
 
-   val = vali - q_delay[quin];            // val = I - Q; 
 
-   if( mode == CW ) val = FIRcw( val );              // bandpass 
-   else val = CIC_comp( val );                       // peak higher freqs
+   // Async complex AM detector
+   // https://www.dsprelated.com/showarticle/938.php
+   // Figure 4.  Hilbert and delay not needed as we already have I and Q signals.
 
-   if( agc_on ) val *= agc;
-   else val *= volume;
-   val >>= 6;
-   if( val > 2*(int)volume ) --agc;                  // volume ranges 0 to 63, signal +- 128
+   if( mode == AM ){                         // decoding AM at baseband does not work well at all
+      val = ( abs(I)/2 + abs(Q)/2 );         // let the carrier pass and then notch it out?
+      val = 2*qdhigh( val );                 // restore DC level with highpass
+   }
+   else{
+      // need to be at 8 bits for hilbert processing
+      tx_hilbert( I );                       // tx hilbert also used for RX
+      //I = vali;
+      q_delay[quin] = Q;                     // circular delay buffer
+      //quin = (quin+1) & 15;                // for length 31 hilbert
+      if( ++quin > 9 ) quin = 0;             // delay for length 19 hilbert
+      //Q = q_delay[quin];
+      val = vali - q_delay[quin];            // val = I - Q;
+   }
+
+   if( mode != CW ) val = CIC_comp( val );              // peak higher freqs
+   val = IIRdf1( val, kf, wi, wo );                     // direct form 1 filter, constants kf updated for desired filter
+
+   // !!! think have a general IIRdf1 call, copy constants into filter when changing modes, filter.
+   // this will eliminate a bunch of if/else as the proper filter will always be in place through non time crunch code
+   // can put wi,wo in the filter code and remove from the call to the filter
+   //  run CIC_comp first for all but CW mode
+
+   if( agc_on ){
+       val *= agc;
+       val >>= 6;
+       if( val > 2*(int)volume ) --agc;                  // volume ranges 0 to 63, signal +- 128
+   }
+   else{
+       val *= volume;
+       val >>= 6;   
+   }
+
       
    val = constrain( val + 128, 0, 255 );             // clip to 8 bits, zero offset for PWM
 
@@ -1718,6 +1775,7 @@ static int8_t quin;
 }
 
 
+
 // CIC compensation: -Alpha/2, 1 + Alpha, -Alpha/2  3 tap FIR.
 int16_t CIC_comp( int16_t val ){
 static int16_t a,b,c;
@@ -1728,51 +1786,23 @@ static int16_t a,b,c;
 }
 
 
+// 8 bit one pole highpass filter  k's are 0.863272, 0.726542, 0, -1, 0   in q6 are 55 46 0 -64 0. Direct form 2
+int16_t qdhigh( int16_t inval ){
+int16_t val;
+static int16_t w0,w1;
 
+   // w0 = a0*value + w1*a1 + w2*a2     a2 is zero
+   val = 55 * inval + 46 * w1;
+   w0 = val >> 6;
 
-
-// length 15 padded to 16
-// sr  5000 or 6000
-const int8_t k_cw[16] =  {
-   (int8_t)(-0.026331 * 64),
-   (int8_t)(-0.020283 * 64),
-   (int8_t)(-0.047333 * 64),
-   (int8_t)(-0.097973 * 64),
-   (int8_t)(-0.084384 * 64),
-   (int8_t)(0.057563 * 64),
-   (int8_t)(0.257407 * 64),
-   (int8_t)(0.352667 * 64),
-   (int8_t)(0.257407 * 64),
-   (int8_t)(0.057563 * 64),
-   (int8_t)(-0.084384 * 64),
-   (int8_t)(-0.097973 * 64),
-   (int8_t)(-0.047333 * 64),
-   (int8_t)(-0.020283 * 64),
-   (int8_t)(-0.026331 * 64),
-      0
-      }; 
-
-
-// FIR bandpass center 600 hz
-// out of cpu when using the menu, changed to lower sample rate for CW mode
-int16_t FIRcw( int16_t inval ){
-static int16_t w[16];
-int i,k;
-static int8_t in;
-int16_t accm;
-
-   w[in] = inval;
-   in = (in +1) & 15;
-   
-   accm = 0;
-   k = in;
-
-   for( i = 0; i < 16; ++i ){
-      accm += k_cw[i] * w[k];
-      k = (k+1) & 15;
-   }
-   return (accm >> 6); 
+   // val = w0 + (w2)*b2 + (w1)*b1      b2 is zero
+   val -= 64 * w1;
+   val >>= 6;
+   w1 = w0;
+   return val;
 }
+
+
 
 
 void smeter( uint8_t db, int16_t agc ){
@@ -1829,109 +1859,35 @@ int8_t b,i,k;
       }
       
       bars = b;
-      LCD.printNumI( bars, RIGHT, ROW6 );
+      LCD.printNumI( bars, RIGHT, ROW6 );    // !!! just for debug
 
 }
 
-/*
-//  Cheby bandpass 300 - 900 at 6000 sr, .3 ripple 30 db
-//  This filter oscillates sometimes when receive sudden increase in signal
-int16_t IIRcw8( int16_t inval ){
-static int16_t w[6];
-int32_t accm;
 
-   accm = 21*inval + 48*w[1] - 30*w[2];
-   accm >>= 6;
-   w[0] = constrain(accm,-32000,32000);
 
-   accm = accm + w[2] + w[1] + w[1];
-   w[2] = w[1];  w[1] = w[0];
 
-   accm = 10*accm + 110*w[4] - 51*w[5];
-   accm >>= 6;
-   w[3] = constrain(accm,-32000,32000);
+// general 2 section direct form 1 filter. Q6 constants as produced by Iowa Hills program , a0 is 1.0, a1 a2 uses subs instead
+// of adds.  Constants will be in order b0,b1,b2,a1,a2,b0,b1,b2,a1,a2 or 10 total, 6 input delay, 6 output delay
+int16_t  IIRdf1( int16_t val, int8_t *k, int16_t *wi, int16_t *wo ){
+uint8_t i;
 
-   accm = accm + w[5] - w[4] - w[4];
-   w[5] = w[4];   w[4] = w[3];
-   return accm;
-}
-*/
+   for( i = 5; i > 0; --i ){                        // move delays
+      wi[i] = wi[i-1];
+      wo[i] = wo[i-1];
+   }
 
-/*
-int16_t IIRcw8( int16_t inval ){
-static int16_t w[3];
-int16_t accm;
-
-   accm = 10*inval + 40*w[1] -15*w[2];
-   accm >>= 6;
-   w[0] = accm;
-
-   accm = accm + w[2] + w[1] + w[1];
-   w[2] = w[1];  w[1] = w[0];
+   // two sections
+   for( i = 0; i < 2; ++i ){
+      wi[0] = val;
+      val = *k++ * wi[0] + *k++ * wi[1] + *k++ * wi[2] - *k++ * wo[1] - *k++ * wo[2];
+      val = constrain( (val >> 6),-128,127 );
+      wo[0] = val;
+      wi += 3;  wo += 3;                           // next section
+   }   
    
-   return accm;
+   return val;
 }
-*/
 
-/*
-//  6 constants.  a0 a1 a2    a0 a1 a2.  b1 is 2.0  b2 is 1.0
-//  6 time delay, 3 for each section, 8 bit inval
-int16_t IIR2BW8( int16_t inval, int8_t k[], int16_t *w ){   // 2 section IIR butterworth
-int16_t accm;
-      
-   // w0 = a0*value + w1*a1 + w2*a2
-     accm = k[0]*inval + k[1]*w[1] + k[2]*w[2];
-     accm >>= 6;
-     *w = accm;
-     
-   // value = w0 + (w2)*b2 + (w1)*b1    and dmov the w terms ( terms backwards for the dmov TMS32xxxx )
-     accm = accm + w[2] + w[1] + w[1];     // b1 = 2, b2 = 1
-     *(w+2) = *(w+1);  *(w+1) = *w;
-
-     w += 3;      // second section
-
-        // w0 = a0*value + w1*a1 + w2*a2
-     accm = k[3]*inval + k[4]*w[1] + k[5]*w[2];
-     accm >>= 6;
-     *w = accm;
-
-   // value = w0 + (w2)*b2 + (w1)*b1    and dmov the w terms ( terms backwards for the dmov TMS32xxxx )
-     accm = accm + w[2] + w[1] + w[1];
-     *(w+2) = *(w+1);  *(w+1) = *w;
-    
-     return accm;
-}
-*/
-/*
-int16_t IIR2_8( int16_t inval, int8_t k[], int16_t *w ){     // 2 section IIR, 8 bit version, max values 128 * 64
-int16_t accm;
-
-     accm = 0;
-      
-   // w0 = a0*value + w1*a1 + w2*a2
-     accm = k[0]*inval + k[1]*w[1] + k[2]*w[2];
-     *w = accm >> 6;
-     
-   // value = w0 + (w2)*b2 + (w1)*b1    and dmov the w terms ( terms backwards for the dmov TMS32xxxx )
-     accm = accm + k[4]*w[2] + k[3]*w[1];
-     accm >>= 6;
-     *(w+2) = *(w+1);  *(w+1) = *w;
-
-   // 2nd section
-     w += 3;
-     
-     // w0 = a0*value + w1*a1 + w2*a2
-     accm = k[5]*accm + k[6]*w[1] + k[7]*w[2];    
-     *w = accm >> 6;
-     
-   // value = w0 + (w2)*b2 + (w1)*b1    and dmov the w terms
-     accm = accm + k[9]*w[2] + k[8]*w[1];
-     accm >>= 6;
-     *(w+2) = *(w+1);  *(w+1) = *w;
-
-     return accm;
-}
-*/
 
 #ifdef I2STATS
  void print_i2stats(){
@@ -2288,23 +2244,37 @@ long accm;
 
 */
 
+
+
 /*
-// 8 bit one pole highpass filter  k's are 0.863272, 0.726542, 0, -1, 0   in q6 are 55 46 0 -64 0
-int16_t qdhigh( int16_t inval, int16_t *w ){
-int16_t val;
+int16_t qdnotch( int16_t inval ){    // wide band noise, fixed, but oscillates on sharp noise
+int32_t val;
+static int16_t w0,w1,w2;
+static int16_t x0,x1,x2;
 
-   // w0 = a0*value + w1*a1 + w2*a2     a2 is zero
-   val = 55 * inval + 46 * w[1];
-   *w = val >> 6;
+  // w0 = a0*value + w1*a1 + w2*a2
+  val = 64*inval + 79*w1 - 50*w2;
+  w0 = val >> 6;
+   
+  // val = b0*w0 + (w2)*b2 + (w1)*b1
+  val = 57*w0 + 57*w2 - 67*w1;            // !!! optimize 57( w0+w2)
+  //val >>= 6;
+  w2 = w1;  w1 = w0;
 
-   // val = w0 + (w2)*b2 + (w1)*b1      b2 is zero
-   val -= 64 * w[1];
-   val >>= 6;
-   *(w+1) = *w;
-   return val;
+  // 2nd section
+  // w0 = a0*value + w1*a1 + w2*a2
+  val = val + 52*x1 - 48*x2;
+  x0 = val >> 6;
+   
+  // val = b0*w0 + (w2)*b2 + (w1)*b1
+  val = 54*x0 + 54*x2 - 63*x1;            // !!! optimize
+  val >>= 6;
+  x2 = x1;  x1 = x0;
+
+  return val;  
 }
-
-
+*/
+/*
 //  6 constants.  a0 a1 a2    a0 a1 a2.  b1 is 2.0  b2 is 1.0
 //  6 time delay, 3 for each section
 int16_t IIR2BW( int16_t inval, int8_t k[], int16_t *w ){   // 2 section IIR butterworth
@@ -2381,4 +2351,221 @@ const int8_t k1bw[] = {               // a0 a1 a2, for butterworth b1 is always 
   (int8_t)( ( -0.665849  ) * 64.0 )
   
 };
+*/
+
+/*
+// a less general version with the idea that the filter will be called only once, delay sections can be static local
+// the general version seems to compile to shorter mult section and inlines the loops
+int16_t  IIRdf1_2( int16_t val, int8_t *k ){
+uint8_t i;
+static int16_t wi[6], wo[6];
+
+   for( i = 5; i > 0; --i ){                        // move delays
+      wi[i] = wi[i-1];
+      wo[i] = wo[i-1];
+   }
+
+   // 1st section
+      wi[0] = val;
+      val = *k++ * wi[0] + *k++ * wi[1] + *k++ * wi[2] - *k++ * wo[1] - *k++ * wo[2];
+      val = constrain( (val >> 6),-128,127 );
+      wi[3] = wo[0] = val;
+   // 2nd section  
+      val = *k++ * wi[3] + *k++ * wi[4] + *k++ * wi[5] - *k++ * wo[4] - *k * wo[5];
+      val = constrain( (val >> 6),-128,127 );
+      wo[3] = val;
+   
+   return val;
+}
+*/
+
+/*
+//  Cheby bandpass 300 - 900 at 6000 sr, .3 ripple 30 db
+//  This filter oscillates sometimes when receive sudden increase in signal
+int16_t IIRcw8( int16_t inval ){
+static int16_t w[6];
+int32_t accm;
+
+   accm = 21*inval + 48*w[1] - 30*w[2];
+   accm >>= 6;
+   w[0] = constrain(accm,-32000,32000);
+
+   accm = accm + w[2] + w[1] + w[1];
+   w[2] = w[1];  w[1] = w[0];
+
+   accm = 10*accm + 110*w[4] - 51*w[5];
+   accm >>= 6;
+   w[3] = constrain(accm,-32000,32000);
+
+   accm = accm + w[5] - w[4] - w[4];
+   w[5] = w[4];   w[4] = w[3];
+   return accm;
+}
+*/
+
+/*
+int16_t IIRcw8( int16_t inval ){
+static int16_t w[3];
+int16_t accm;
+
+   accm = 10*inval + 40*w[1] -15*w[2];
+   accm >>= 6;
+   w[0] = accm;
+
+   accm = accm + w[2] + w[1] + w[1];
+   w[2] = w[1];  w[1] = w[0];
+   
+   return accm;
+}
+*/
+
+/*
+//  6 constants.  a0 a1 a2    a0 a1 a2.  b1 is 2.0  b2 is 1.0
+//  6 time delay, 3 for each section, 8 bit inval
+int16_t IIR2BW8( int16_t inval, int8_t k[], int16_t *w ){   // 2 section IIR butterworth
+int16_t accm;
+      
+   // w0 = a0*value + w1*a1 + w2*a2
+     accm = k[0]*inval + k[1]*w[1] + k[2]*w[2];
+     accm >>= 6;
+     *w = accm;
+     
+   // value = w0 + (w2)*b2 + (w1)*b1    and dmov the w terms ( terms backwards for the dmov TMS32xxxx )
+     accm = accm + w[2] + w[1] + w[1];     // b1 = 2, b2 = 1
+     *(w+2) = *(w+1);  *(w+1) = *w;
+
+     w += 3;      // second section
+
+        // w0 = a0*value + w1*a1 + w2*a2
+     accm = k[3]*inval + k[4]*w[1] + k[5]*w[2];
+     accm >>= 6;
+     *w = accm;
+
+   // value = w0 + (w2)*b2 + (w1)*b1    and dmov the w terms ( terms backwards for the dmov TMS32xxxx )
+     accm = accm + w[2] + w[1] + w[1];
+     *(w+2) = *(w+1);  *(w+1) = *w;
+    
+     return accm;
+}
+*/
+/*
+int16_t IIR2_8( int16_t inval, int8_t k[], int16_t *w ){     // 2 section IIR, 8 bit version, max values 128 * 64
+int16_t accm;
+
+     accm = 0;
+      
+   // w0 = a0*value + w1*a1 + w2*a2
+     accm = k[0]*inval + k[1]*w[1] + k[2]*w[2];
+     *w = accm >> 6;
+     
+   // value = w0 + (w2)*b2 + (w1)*b1    and dmov the w terms ( terms backwards for the dmov TMS32xxxx )
+     accm = accm + k[4]*w[2] + k[3]*w[1];
+     accm >>= 6;
+     *(w+2) = *(w+1);  *(w+1) = *w;
+
+   // 2nd section
+     w += 3;
+     
+     // w0 = a0*value + w1*a1 + w2*a2
+     accm = k[5]*accm + k[6]*w[1] + k[7]*w[2];    
+     *w = accm >> 6;
+     
+   // value = w0 + (w2)*b2 + (w1)*b1    and dmov the w terms
+     accm = accm + k[9]*w[2] + k[8]*w[1];
+     accm >>= 6;
+     *(w+2) = *(w+1);  *(w+1) = *w;
+
+     return accm;
+}
+*/
+
+// try a direct form I filter instead of the direct form II and see if stable
+// swapping signs on the a1 a2 terms for all adds formula
+/*
+Sect 0
+a0   1.000000000000000000
+a1   1.585280958391858120   101
+a2   -0.741224118467670001   47
+b0   -0.298188434384186241   19
+b1   0.000000000000000000     0
+b2   0.298188434384186241    19
+
+Sect 1
+a0   1.000000000000000000
+a1   0.959928298017437731    61
+a2   -0.558752139873679221   36
+b0   -0.224781441464945275   14
+b1   0.000000000000000000     0
+b2   0.224781441464945275    14
+*/
+
+/*
+int16_t IIRcw8( int16_t inval ){
+static int wi[6], wo[6];
+uint8_t i;
+int16_t val;
+
+
+   for( i = 5; i > 0; --i ){
+      wi[i] = wi[i-1];
+      wo[i] = wo[i-1];
+   }
+   // 1st section
+   wi[0] = inval;
+   val = -19*wi[0] + 19*wi[2]  + 101*wo[1] - 47*wo[2];    // b1 is zero  19*(wi[2] - wi[0])
+   wo[0] = val >> 6;
+   wo[0] = constrain(wo[0],-128,127);                     // seems to be stable with the constrain values
+
+   // 2nd section
+   wi[3] = wo[0];
+   val = -14*wi[3] + 14*wi[5]  +  61*wo[4] - 36*wo[5];    //   14*(wi[5] - wi[3])
+   wo[3] = val >> 6;
+   wo[3] = constrain(wo[3],-128,127);
+   
+   return wo[3];
+}
+*/
+/*
+// length 15 padded to 16
+// sr  5000 or 6000
+const int8_t k_cw[16] =  {
+   (int8_t)(-0.026331 * 64),
+   (int8_t)(-0.020283 * 64),
+   (int8_t)(-0.047333 * 64),
+   (int8_t)(-0.097973 * 64),
+   (int8_t)(-0.084384 * 64),
+   (int8_t)(0.057563 * 64),
+   (int8_t)(0.257407 * 64),
+   (int8_t)(0.352667 * 64),
+   (int8_t)(0.257407 * 64),
+   (int8_t)(0.057563 * 64),
+   (int8_t)(-0.084384 * 64),
+   (int8_t)(-0.097973 * 64),
+   (int8_t)(-0.047333 * 64),
+   (int8_t)(-0.020283 * 64),
+   (int8_t)(-0.026331 * 64),
+      0
+      }; 
+
+
+// FIR bandpass center 600 hz
+// out of cpu when using the menu, changed to lower sample rate for CW mode
+int16_t FIRcw( int16_t inval ){
+static int16_t w[16];
+int i,k;
+static int8_t in;
+int16_t accm;
+
+   w[in] = inval;
+   in = (in +1) & 15;
+   
+   accm = 0;
+   k = in;
+
+   for( i = 0; i < 16; ++i ){
+      accm += k_cw[i] * w[k];
+      k = (k+1) & 15;
+   }
+   return (accm >> 6); 
+}
 */
