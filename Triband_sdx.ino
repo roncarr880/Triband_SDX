@@ -226,12 +226,12 @@ uint8_t bits = 6;                      // agc bits.  If compile as no-agc then g
 // Direct form 1 IIR filters, constants in b0,b1,b2,a1,a2 order, 2 sections
 const int8_t filters[7][10] PROGMEM = {
    {  64, 0, 0, 0, 0, 64, 0, 0, 0, 0 },                  // passthrough SSB
-   { 0 },
-   { 0 },
+   { 37,75,37,67,19, 47,94,47,84,40 },                   // 2400 butterworth
+   { 27,54,27,36,7, 36,73,36,49,32 },                    // 2000
    { -19, 0, 19, -101, 47,  -14, 0, 14, -61, 36 },       // CW wide
-   { 0 },
-   { 0 },
-   { 57, -58, 57, -69, 51,  55, -54, 55, -43, 49}        // AM notch at 1kc
+   { -14,0,14,-87,43, -12,0,12,-64,39 },                 // bessel 300
+   { -7,0,7,-89,52, -7,0,7,-78,50 },                     // bessel 150
+   { 46,-92,46,-89,31, 54,-108,54,-104,48 }              // AM highpass
 };
 int8_t  kf[10] = {  64, 0, 0, 0, 0, 64, 0, 0, 0, 0 };    // default as passthrough
 int16_t wi[6], wo[6];                                    // delay terms for the IIR filter
@@ -1111,8 +1111,8 @@ void load_filter(){                 // copy filter constants from flash to ram
 uint8_t f,c;
 uint8_t i;
 
-   f = filter;                      // set for SSB filters
-   if( mode == AM ) f = 6;
+   f = filter;                      // set up for SSB filters
+   if( mode == AM ) f =  6;         // highpass
    if( mode == CW ) f += 3;
 
    noInterrupts();
@@ -1729,10 +1729,10 @@ static int8_t quin;
    // Async complex AM detector
    // https://www.dsprelated.com/showarticle/938.php
    // Figure 4.  Hilbert and delay not needed as we already have I and Q signals.
+         //val = ( abs(I)/2 + abs(Q)/2 );
 
    if( mode == AM ){                         // decoding AM at baseband does not work well at all
-      val = ( abs(I)/2 + abs(Q)/2 );         // let the carrier pass and then notch it out?
-      val = 2*qdhigh( val );                 // restore DC level with highpass
+      val = fastAM( I/2, Q/2 );
    }
    else{
       // need to be at 8 bits for hilbert processing
@@ -1744,14 +1744,11 @@ static int8_t quin;
       //Q = q_delay[quin];
       val = vali - q_delay[quin];            // val = I - Q;
    }
+  
 
-   if( mode != CW ) val = CIC_comp( val );              // peak higher freqs
-   val = IIRdf1( val, kf, wi, wo );                     // direct form 1 filter, constants kf updated for desired filter
-
-   // !!! think have a general IIRdf1 call, copy constants into filter when changing modes, filter.
-   // this will eliminate a bunch of if/else as the proper filter will always be in place through non time crunch code
-   // can put wi,wo in the filter code and remove from the call to the filter
-   //  run CIC_comp first for all but CW mode
+   if( mode == USB || mode == LSB ) val = CIC_comp( val );    // peak higher freqs
+   val = IIRdf1( val, kf, wi, wo );                           // direct form 1 filter, constants kf updated for desired filter
+   if( mode == AM ) val *= 2;                                 // lost a bit on the AM decoder, need highpass filter before this *2
 
    if( agc_on ){
        val *= agc;
@@ -1786,6 +1783,7 @@ static int16_t a,b,c;
 }
 
 
+/*
 // 8 bit one pole highpass filter  k's are 0.863272, 0.726542, 0, -1, 0   in q6 are 55 46 0 -64 0. Direct form 2
 int16_t qdhigh( int16_t inval ){
 int16_t val;
@@ -1801,7 +1799,7 @@ static int16_t w0,w1;
    w1 = w0;
    return val;
 }
-
+*/
 
 
 
