@@ -220,10 +220,10 @@ const char msg4[] PROGMEM = "K1URC wb2cba pe1nnz";
 const char msg5[] PROGMEM = "EEPROM ? Check vars";
 
 int16_t  agc;                          // made variable global for the s meter
-uint8_t bits = 6;                      // agc bits.  If compile as no-agc then get 10 bits out of the CIC filter. 
-                                       // use the attenuator to avoid overload during testing
+uint8_t bits = 6;                      // agc bits == number of bits shifted out of the CIC filter process 
 
-// Direct form 1 IIR filters, constants in b0,b1,b2,a1,a2 order, 2 sections
+
+// Direct form 1 IIR filters, Q6 constants in b0,b1,b2,a1,a2 order, 2 sections
 const int8_t filters[7][10] PROGMEM = {
    {  64, 0, 0, 0, 0, 64, 0, 0, 0, 0 },                  // passthrough SSB
    { 37,75,37,67,19, 47,94,47,84,40 },                   // 2400 butterworth
@@ -231,11 +231,12 @@ const int8_t filters[7][10] PROGMEM = {
    { -19, 0, 19, -101, 47,  -14, 0, 14, -61, 36 },       // CW wide
    { -14,0,14,-87,43, -12,0,12,-64,39 },                 // bessel 300
    { -7,0,7,-89,52, -7,0,7,-78,50 },                     // bessel 150
-   { 46,-92,46,-89,31, 54,-108,54,-104,48 }              // AM highpass
+  // { 46,-92,46,-89,31, 54,-108,54,-104,48 }              // AM highpass makes noise by itself
+   { 59,-60,59,-67,55, 58,-57,58,-51,55 }                // AM notch at 1k
 };
 int8_t  kf[10] = {  64, 0, 0, 0, 0, 64, 0, 0, 0, 0 };    // default as passthrough
 int16_t wi[6], wo[6];                                    // delay terms for the IIR filter
-uint8_t filter;                                          // chosen filter ( menu item
+uint8_t filter;                                          // chosen filter,  menu item
 
 
 void setup() {
@@ -1112,7 +1113,7 @@ uint8_t f,c;
 uint8_t i;
 
    f = filter;                      // set up for SSB filters
-   if( mode == AM ) f =  6;         // highpass
+   if( mode == AM ) f =  6;         // notch 1k
    if( mode == CW ) f += 3;
 
    noInterrupts();
@@ -1677,13 +1678,8 @@ static int8_t inrx, outrx;            // pipeline indexes
   
 }
 
-// !!! find a good place to put filter constants, maybe at the very top with all else
-//   k[mode == CW ? 0:1 ][filter#][consts]
-//int8_t kcw[10] = { -19, 0, 19, -101, 47,  -14, 0, 14, -61, 36 };   // 2 sections of b0,b1,b2,a1,a2
-//int8_t kam[10] = { 57, -58, 57, -69, 51,  55, -54, 55, -43, 49};   // am notch at 1kc
-//int16_t wi[6], wo[6];
 
-
+//int dbval;   //!!! debug
 
 // some non-interrupt rx processing,  will this work from loop(), added a pipeline as it fell behind.
 // calc rx_val to be sent to PWM audio on the rx interrupt.  Hilbert phasing version
@@ -1729,10 +1725,11 @@ static int8_t quin;
    // Async complex AM detector
    // https://www.dsprelated.com/showarticle/938.php
    // Figure 4.  Hilbert and delay not needed as we already have I and Q signals.
-         //val = ( abs(I)/2 + abs(Q)/2 );
+   //val = ( abs(I)/2 + abs(Q)/2 );    the fastAM sounds better
 
    if( mode == AM ){                         // decoding AM at baseband does not work well at all
-      val = fastAM( I/2, Q/2 );
+      val = fastAM( I/2, Q/2 );              // tune off freq and notch out the carrier
+      val = 2*qdhigh( val );                 // remove DC offset
    }
    else{
       // need to be at 8 bits for hilbert processing
@@ -1746,21 +1743,16 @@ static int8_t quin;
    }
   
 
-   if( mode == USB || mode == LSB ) val = CIC_comp( val );    // peak higher freqs
-   val = IIRdf1( val, kf, wi, wo );                           // direct form 1 filter, constants kf updated for desired filter
-   if( mode == AM ) val *= 2;                                 // lost a bit on the AM decoder, need highpass filter before this *2
+   if( mode != CW )  val = CIC_comp( val );          // peak higher freqs
+   val = IIRdf1( val, kf, wi, wo );                  // direct form 1 filter, constants kf updated for desired filter
 
-   if( agc_on ){
-       val *= agc;
-       val >>= 6;
-       if( val > 2*(int)volume ) --agc;                  // volume ranges 0 to 63, signal +- 128
-   }
-   else{
-       val *= volume;
-       val >>= 6;   
-   }
+   if( agc_on ) val *= agc;
+   else val *= volume;
+   val >>= 6;
+   if( (abs(val)) > 2*(int)volume && agc > 0 ) --agc;     // volume ranges 0 to 63, signal +- 128
 
-      
+   //dbval = val;
+
    val = constrain( val + 128, 0, 255 );             // clip to 8 bits, zero offset for PWM
 
    noInterrupts();
@@ -1783,7 +1775,7 @@ static int16_t a,b,c;
 }
 
 
-/*
+
 // 8 bit one pole highpass filter  k's are 0.863272, 0.726542, 0, -1, 0   in q6 are 55 46 0 -64 0. Direct form 2
 int16_t qdhigh( int16_t inval ){
 int16_t val;
@@ -1799,13 +1791,13 @@ static int16_t w0,w1;
    w1 = w0;
    return val;
 }
-*/
-
 
 
 void smeter( uint8_t db, int16_t agc ){
 static int8_t bars;
 int8_t b,i,k;
+
+  // LCD.printNumI( dbval, CENTER, ROW6, 5, ' ' );   // debug
 
       if( menu_on ){
         bars = 0;
@@ -1904,6 +1896,7 @@ uint8_t i;
            j = tx_i2late;      tx_i2late = 0;
            interrupts();
            LCD.clrRow( 7 );
+           //LCD.clrRow( 6 );
           // LCD.printNumI( a, LEFT, ROW7 );       // should be biggest number, interrupts working
           // LCD.printNumI( b, CENTER, ROW7 );     // some OLED functions may overfill our buffer, polling counts here
           // LCD.printNumI( c, RIGHT, ROW7 );      // polling may cause int flags out of sync with i2state, counts here
@@ -1912,6 +1905,7 @@ uint8_t i;
           //LCD.printNumI(ADCSRA & 7 , CENTER, ROW7 );    // check auto ADC baud rate value
           LCD.printNumI( f, CENTER, ROW7 );        // pipeline delay
           LCD.printNumI( e, RIGHT, ROW7 );         // rx underruns
+
           
           //LCD.printNumI( j, RIGHT, ROW6 );         // tx i2c late
           //LCD.printNumI( g, CENTER, ROW7 );        // tx pipeline
