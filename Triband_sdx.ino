@@ -203,7 +203,7 @@ uint8_t tx_inhibit = 1;        // start with a band switches check message befor
 uint8_t s_tone;                // sidetone independant of actual transmit condition
 volatile int     break_in;     // semi break in counter
 volatile int8_t  waveshape;    // cw wave shaping from sine cosine table
-uint8_t menu_on = 1;
+uint8_t menu_on = 1;           // screen sharing flag
 
 // CIC filter compensation     FIR filter of length 3 with constants  -alpha/2,  alpha+1, -alpha/2
 uint8_t a_alpha = 5;
@@ -222,7 +222,7 @@ const char msg5[] PROGMEM = "EEPROM ? Check vars";
 
 int16_t  agc;                          // made variable global for the s meter
 uint8_t bits = 6;                      // agc bits == number of bits shifted out of the CIC filter process
-int16_t cw_signal;                    // for cw decoder
+int16_t cw_signal;                     // for cw decoder
 uint8_t cw_count;
 
 
@@ -1927,34 +1927,27 @@ int8_t dah_table[8] = { 20,20,20,20,20,20,20,20 };      // morse speed determine
 int8_t dah_in;                                          // designed to work up to 25 wpm
 
 
-int8_t cw_detect(int16_t av ){
+int8_t cw_detect(int16_t sig ){
 uint8_t det;                       // cw mark space detect
 static int8_t count;               // mark,space counts
-static int16_t tval;              // top value
-static int16_t bval;              // bottom value
 int8_t stored;
-static int8_t mod;
-int16_t mval;                     // mid value
+static uint8_t mod;                // morse scope speed
+static uint8_t wav;                 
+static uint8_t col;
 
 
-   if( av < 0 ) av = -av;
-   
-   // set new limit values, leak top and bottom toward each other
-   //if( (mod & 7) == 7 ) ++bval, --tval;
-   //if( av > tval ) tval = av;
-   //if( av < bval ) bval = av;
-
-   //mval = ( tval + bval + 20 ) >> 1;                   // average + offset
-   det = ( av > 50 ) ? 1 : 0;
+   det = ( sig > 50 ) ? 1 : 0;
    det = cw_denoise( det );
 
-if( ++mod == 0 ){
-   LCD.printNumI( av, LEFT, ROW7, 4, ' ');
-  // LCD.printNumI( mval, CENTER, ROW7, 4, ' ');
-  // LCD.printNumI( tval, RIGHT, ROW7, 4, ' ' );   
-}
-if( mod == 1 )LCD.printNumI( av, CENTER, ROW7, 4, ' ');
-if( mod == 2 )LCD.printNumI( av, RIGHT, ROW7, 4, ' ' );
+   if( det ) wav >>= 1;                    // morse signal graph       
+   if( ++mod == 3 ){
+      LCD.gotoRowCol( 5,col );
+      if( wav != 0x80 ) LCD.write(wav);
+      else LCD.write(0);
+      if( ++col > 127 ) col = 0;
+      wav = 0x80;
+      mod = 0;
+   }
 
    stored = 0;               // when find a change in the signal, save the counts for later use
    if( det ){                // marking, negative counts
@@ -1969,7 +1962,7 @@ if( mod == 2 )LCD.printNumI( av, RIGHT, ROW7, 4, ' ' );
         storecount(count), stored = 1;
         count = 0; 
       }
-      ++count;
+      if( count < 120 ) ++count;                        // keep from overflowing to -127
       if( count == 99 ) storecount(count), stored = 1;  // one second no signal
    }
    
@@ -2001,7 +1994,7 @@ void storecount( int8_t count ){
 
      if( count < 0 ){      // save dah counts
         count = -count;
-        if( count >= 12 ){      // 12 for 10ms per sample, 40 for 3ms?  works up to 25 wpm
+        if( count >= 12 ){      // 12 for 10ms per sample, works up to 25 wpm
           dah_table[dah_in++] = count;
           dah_in &= 7;
         }
@@ -2072,17 +2065,8 @@ static int8_t wt;    /* heavy weighting will mess up the algorithm, so this comp
 static int8_t singles;
 static int8_t farns,ch_count;
 static int8_t eees;
-//static uint32_t tm;
-//static uint16_t tval;
 
-   if( transmitting) return;
-   //tval += val;
-
-  // if( ( millis() - tm ) < 9 ) return;     // run at 10ms rate if at 16mhz clock
-  // tm = millis();
-  // val = tval;
-  // tval = 0;
-   
+   if( transmitting || menu_on ) return;   
 
    if( cw_detect( val ) == 0 && cread_indx < 15 ) return;
    if( cread_indx < 2 ) return;    // need at least one mark and one space in order to decode something
@@ -2128,7 +2112,7 @@ static int8_t eees;
  
    if( m_ch ){   /* found something so print it */
       ++ch_count;
-      if( m_ch == 'E' || m_ch == 'I' || m_ch == 'T') ++eees;         // !!! just T is printing
+      if( m_ch == 'E' || m_ch == 'I' ) ++eees;  // suppress noise prints
       else eees = 0;
       if( eees < 5 ){
          decode_print(m_ch);
@@ -2136,7 +2120,7 @@ static int8_t eees;
       if( cread_buf[ls] > 3*slicer + farns ){   // check for word space
         if( ch_count == 1 ) ++farns;            // single characters, no words printed
         ch_count= 0;
-        if( eees < 5 ) decode_print(' ');
+        decode_print(' ');
       }
    }
      
@@ -2152,6 +2136,7 @@ static int8_t eees;
 }
 
 
+// print on rows 6 and 7
 void decode_print( char c ){
 static uint8_t row = 6, col = 0;
 
@@ -2161,7 +2146,7 @@ static uint8_t row = 6, col = 0;
    col += 6;
    if( col > 126 - 6 ){
       col = 0, ++row;
-      if( row >= 7 ) row = 6;          // !!! debug, just row 6 used
+      if( row > 7 ) row = 6;
    }
    else LCD.putch(' ');                // erase one char ahead
 
