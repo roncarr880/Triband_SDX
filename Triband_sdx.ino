@@ -74,6 +74,7 @@ SOFTWARE.
 #include <OLED1306_Basic.h>
 #include <EEPROM.h>
 #include "sine_cosine.h"
+#include "my_morse.h"
 
 #define ENC_A  6
 #define ENC_B  7
@@ -220,7 +221,9 @@ const char msg4[] PROGMEM = "K1URC wb2cba pe1nnz";
 const char msg5[] PROGMEM = "EEPROM ? Check vars";
 
 int16_t  agc;                          // made variable global for the s meter
-uint8_t bits = 6;                      // agc bits == number of bits shifted out of the CIC filter process 
+uint8_t bits = 6;                      // agc bits == number of bits shifted out of the CIC filter process
+int16_t cw_signal;                    // for cw decoder
+uint8_t cw_count;
 
 
 // Direct form 1 IIR filters, Q6 constants in b0,b1,b2,a1,a2 order, 2 sections
@@ -329,7 +332,10 @@ int t;
   if( tm != millis()){          // 1 ms routines ( a quick 1ms - 20meg clock vs 16meg )
      tm = millis();
      robin = 1;
-     if( mode == CW ) keyer();
+     if( mode == CW ){
+        keyer();
+        if( cw_count ) code_read( cw_signal ), cw_count = 0;
+     }
      else ptt();
 
      noInterrupts();
@@ -480,13 +486,18 @@ char b;
 
 
 void qsy( int8_t f ){
+int st;
 
-   if( rit_enabled ) freq = (int32_t)freq + f * 10;        // tune by 10 hz
-   else freq = (int32_t)freq + f * step_;
+   st = step_;                            // different step depending upon mode
+   if( mode == CW ) st = st >> 1;
+   if( rit_enabled ) st = 10;
+   
+   freq = (int32_t)freq + f * st;
    calc_divider();
    if( mode == USB ) si5351.freq( freq, 0, 90, divider );
    else si5351.freq( freq, 90, 0, divider );
    display_freq();
+      // !!! do offsets for cw and AM, 600hz, 1k hz
    
 }
 
@@ -1505,13 +1516,14 @@ static uint8_t tx_in, tx_out;
 
 int16_t fastAM( int16_t i, int16_t q ){           // estimation of sqrt( i^2 + q^2 )
 
-  /*
+  
     // quicker version   max + min/4
        i = abs(i);   q = abs(q);  
        if( i > q ) q >>= 2;
        else i >>= 2;
        return ( i + q );
-  */
+
+  /*
      // better accuracy version   max or 7/8 max + 1/2 min
 int16_t mb4; 
 
@@ -1524,7 +1536,8 @@ int16_t mb4;
     q -= ( mb4 >> 1 );                     // 7/8 * q == q - 1/8q
     i = i >> 1;
     
-    return ( i + q );  
+    return ( i + q );
+    */
 }
 
 
@@ -1682,8 +1695,7 @@ static int8_t inrx, outrx;            // pipeline indexes
 //int dbval;   //!!! debug
 
 // some non-interrupt rx processing,  will this work from loop(), added a pipeline as it fell behind.
-// calc rx_val to be sent to PWM audio on the rx interrupt.  Hilbert phasing version
-// heard some images out of the CIC filter, at delta 24k 48k,  increased the length to 3.
+// calc rx_val to be sent to PWM audio on the rx interrupt.  Hilbert phasing version.
 void rx_process2(){
 int val;
 static uint8_t rxout, rxin;
@@ -1705,6 +1717,7 @@ static int8_t quin;
 
    // at 16 bits, need to go to 8 bits while keeping as many information bits as possible
    // impliment a 4 bit compressor, always drop 4 bits, bits are dropped in the CIC filter process
+   // need to be at 8 bits for hilbert processing
 
    if( I > sig_level ) sig_level = I;                    // peak signal detect
    
@@ -1732,7 +1745,6 @@ static int8_t quin;
       val = 2*qdhigh( val );                 // remove DC offset
    }
    else{
-      // need to be at 8 bits for hilbert processing
       tx_hilbert( I );                       // tx hilbert also used for RX
       //I = vali;
       q_delay[quin] = Q;                     // circular delay buffer
@@ -1743,8 +1755,9 @@ static int8_t quin;
    }
   
 
-   if( mode != CW )  val = CIC_comp( val );          // peak higher freqs
    val = IIRdf1( val, kf, wi, wo );                  // direct form 1 filter, constants kf updated for desired filter
+   if( mode != CW )  val = CIC_comp( val );          // peak higher freqs
+   else goertzel( val );
 
    if( agc_on ) val *= agc;
    else val *= volume;
@@ -1764,6 +1777,31 @@ static int8_t quin;
 }
 
 
+// sample rate 6000, 10ms N = 60, k = 6? for 600hz tone, q = 2*cos(2pi*K/N), a = inval + q*b - c
+// sample rage 5000, 10ms N = 50, k = 7 for 600 hz tone, 
+void goertzel( int16_t val ){
+const int8_t q = (int8_t)( 1.2748 * 64.0 );
+const int8_t cs= ( int8_t)(0.637 * 64.0 );
+const int8_t sn= ( int8_t)(0.770 * 64.0 );
+static int16_t a,b,c;                           // delay terms
+static int8_t i;                                // iterations
+
+   if( i == 0 ){                                // done, save result
+      a = (c * cs) >> 6;
+      a = b - a;
+      c = (c * sn ) >> 6;
+      cw_signal = fastAM(a,c);
+      cw_count = 1;
+      b = c = 0;                                // reset
+   }
+  
+   a = q*b >> 6;
+   a += val - c;
+   c = b;  b = a;
+   
+   if( ++i == 50 ) i = 0;
+  
+}
 
 // CIC compensation: -Alpha/2, 1 + Alpha, -Alpha/2  3 tap FIR.
 int16_t CIC_comp( int16_t val ){
@@ -1877,6 +1915,264 @@ uint8_t i;
    
    return val;
 }
+
+
+
+// ***************   group of functions for a read behind morse decoder    ******************
+//   attempts to correct for incorrect code spacing, the most common fault.
+
+int8_t cread_buf[16];
+int8_t cread_indx;
+int8_t dah_table[8] = { 20,20,20,20,20,20,20,20 };      // morse speed determined by length of the dah's
+int8_t dah_in;                                          // designed to work up to 25 wpm
+
+
+int8_t cw_detect(int16_t av ){
+uint8_t det;                       // cw mark space detect
+static int8_t count;               // mark,space counts
+static int16_t tval;              // top value
+static int16_t bval;              // bottom value
+int8_t stored;
+static int8_t mod;
+int16_t mval;                     // mid value
+
+
+   if( av < 0 ) av = -av;
+   
+   // set new limit values, leak top and bottom toward each other
+   //if( (mod & 7) == 7 ) ++bval, --tval;
+   //if( av > tval ) tval = av;
+   //if( av < bval ) bval = av;
+
+   //mval = ( tval + bval + 20 ) >> 1;                   // average + offset
+   det = ( av > 50 ) ? 1 : 0;
+   det = cw_denoise( det );
+
+if( ++mod == 0 ){
+   LCD.printNumI( av, LEFT, ROW7, 4, ' ');
+  // LCD.printNumI( mval, CENTER, ROW7, 4, ' ');
+  // LCD.printNumI( tval, RIGHT, ROW7, 4, ' ' );   
+}
+if( mod == 1 )LCD.printNumI( av, CENTER, ROW7, 4, ' ');
+if( mod == 2 )LCD.printNumI( av, RIGHT, ROW7, 4, ' ' );
+
+   stored = 0;               // when find a change in the signal, save the counts for later use
+   if( det ){                // marking, negative counts
+      if( count > 0 ){
+         if( count < 99 ) storecount(count), stored = 1;
+         count = 0;
+      }
+      --count;
+   }
+   else{                     // spacing
+      if( count < 0 ){
+        storecount(count), stored = 1;
+        count = 0; 
+      }
+      ++count;
+      if( count == 99 ) storecount(count), stored = 1;  // one second no signal
+   }
+   
+   return stored;
+}
+
+// slide some bits around to remove 1 reversal of mark space
+int8_t cw_denoise( int8_t m ){
+static int8_t val;
+
+   if( m ){
+      val <<= 1;
+      val |= 1;
+   }
+   else val >>= 1;
+
+   val &= 7;
+   if( m ) return val & 4;      // need 3 marks in a row to return true
+   else return val & 2;         // 1 extra mark returned when spacing
+                                // so min mark count we see is -2 if this works correctly
+                                // this shortens mark count by 1 which may be ok
+}
+
+// store mark space counts for cw decode
+void storecount( int8_t count ){
+
+     cread_buf[cread_indx++] = count;
+     cread_indx &= 15;
+
+     if( count < 0 ){      // save dah counts
+        count = -count;
+        if( count >= 12 ){      // 12 for 10ms per sample, 40 for 3ms?  works up to 25 wpm
+          dah_table[dah_in++] = count;
+          dah_in &= 7;
+        }
+     }
+}
+
+void shuffle_down( int8_t count ){    /* consume the stored code read counts */
+int8_t i;
+
+  for( i= count; i < cread_indx; ++i ){
+    cread_buf[i-count] = cread_buf[i];
+  }
+  
+  cread_indx -= count;
+  cread_indx &= 15;     // just in case out of sync  
+}
+
+
+int8_t code_read_scan(int8_t slice){  /* find a letter space */
+int8_t ls, i;
+
+/* scan for a letter space */
+   ls = -1;
+   for( i= 0; i < cread_indx; ++i ){
+      if( cread_buf[i] > slice ){
+        ls = i;
+        break;
+      }
+   }
+   return ls;   
+}
+
+
+unsigned char morse_lookup( int8_t ls, int8_t slicer){
+unsigned char m_ch, ch;
+int8_t i,elcount;
+
+   /* form morse in morse table format */
+   m_ch= 0;  elcount= 1;  ch= 0;
+   for( i = 0; i <= ls; ++i ){
+     if( cread_buf[i] > 0 ) continue;   /* skip the spaces */
+     if( cread_buf[i] < -slicer ) m_ch |= 1;
+     m_ch <<= 1;
+     ++elcount;
+   }
+   m_ch |= 1;
+   /* left align */
+   while( elcount++ < 8 ) m_ch <<= 1;
+
+   /* look up in table */
+   for( i = 0; i < 47; ++i ){
+      if( m_ch == pgm_read_byte(&morse[i]) ){
+        ch = i+',';
+        break;
+      }
+   }
+
+   return ch;  
+}
+
+
+void code_read( int16_t val ){  /* convert the stored mark space counts to a letter on the screen */
+int16_t slicer;
+int8_t i;
+unsigned char m_ch;
+int8_t ls,force;
+static int8_t wt;    /* heavy weighting will mess up the algorithm, so this compensation factor */
+static int8_t singles;
+static int8_t farns,ch_count;
+static int8_t eees;
+//static uint32_t tm;
+//static uint16_t tval;
+
+   if( transmitting) return;
+   //tval += val;
+
+  // if( ( millis() - tm ) < 9 ) return;     // run at 10ms rate if at 16mhz clock
+  // tm = millis();
+  // val = tval;
+  // tval = 0;
+   
+
+   if( cw_detect( val ) == 0 && cread_indx < 15 ) return;
+   if( cread_indx < 2 ) return;    // need at least one mark and one space in order to decode something
+
+   /* find slicer from dah table */
+   slicer= 0;   force= 0;
+   for( i = 0; i < 8; ++i ){
+     slicer += dah_table[i];
+   }
+   slicer >>= 4;   /* divide by 8 and take half the value */
+
+   ls = code_read_scan(slicer + wt);
+   
+   if( ls == -1 && cread_indx == 15 ){   // need to force a decode
+      for(i= 1; i < 30; ++i ){
+        ls= code_read_scan(slicer + wt - i);
+        if( ls >= 0 ) break;
+      } 
+      --wt;    /* compensate for short letter spaces */
+      force= 1;
+   }
+   
+   if( ls == -1 ) return;
+   
+   m_ch = morse_lookup( ls, slicer );
+   
+   /* are we getting just E and T */
+   if( m_ch == 'E' || m_ch == 'T' ){   /* less weight compensation needed */
+      if( ++singles == 4 ){
+         ++wt;
+         singles = 0;
+      }
+   }
+   else if( m_ch ) singles = 0;   
+  
+   /* if no char match, see if can get a different decode */
+   if( m_ch == 0 && force == 0 ){
+     ls = code_read_scan( slicer + wt - ( slicer >> 2 ) );
+     m_ch = morse_lookup( ls, slicer );
+     if( m_ch > 64 ) m_ch += 32;       // lower case for this algorithm
+     //if( m_ch ) --wt;     this doesn't seem to be a good idea
+   }
+ 
+   if( m_ch ){   /* found something so print it */
+      ++ch_count;
+      if( m_ch == 'E' || m_ch == 'I' || m_ch == 'T') ++eees;         // !!! just T is printing
+      else eees = 0;
+      if( eees < 5 ){
+         decode_print(m_ch);
+      }
+      if( cread_buf[ls] > 3*slicer + farns ){   // check for word space
+        if( ch_count == 1 ) ++farns;            // single characters, no words printed
+        ch_count= 0;
+        if( eees < 5 ) decode_print(' ');
+      }
+   }
+     
+   if( ls < 0 ) ls = 0;   // check if something wrong just in case  
+   shuffle_down( ls+1 );  
+
+   /* bounds for weight */
+   if( wt > slicer ) wt = slicer;
+   if( wt < -(slicer >> 1)) wt= -(slicer >> 1);
+   
+   if( ch_count > 10 ) --farns;
+   
+}
+
+
+void decode_print( char c ){
+static uint8_t row = 6, col = 0;
+
+   
+   LCD.gotoRowCol( row, col );
+   LCD.putch(c);
+   col += 6;
+   if( col > 126 - 6 ){
+      col = 0, ++row;
+      if( row >= 7 ) row = 6;          // !!! debug, just row 6 used
+   }
+   else LCD.putch(' ');                // erase one char ahead
+
+}
+
+//  ***************   end of morse decode functions
+
+
+
+
+
 
 
 #ifdef I2STATS
