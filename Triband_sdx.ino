@@ -37,10 +37,14 @@
  *   Select: Tap opens menu, another Tap enables edit , DTap opens menu in edit mode, Long Press qsy's -100kc
  *   Exit  : Tap backs out of menu one step, DTap backs out all the way, Long Press qsy's +100kc
  *           Also used to enable TX after a band change and to exit from RIT.
- *           Also turns on the S meter.
+ *           Also turns on the S meter and enables the CW decoder.
  *   Encoder: Long Press opens Volume directly for edit.
  *            Tap changes tuning step 
- *            Dtap  ( unassigned )
+ *            Dtap  toggles Tune Power / Full Power 
+ *            
+ *   RIT function is enabled on transmit.  Tap exit to cancel.        
+ *   AM is tuned 1khz high, carrier is removed with a notch filter.
+ *   3 power levels, Band Change - check band switches message == no power,  Tune Power, Full Power.
  *   
  *   avr-objdump -S Triband_sdx.ino.elf to see the assembly code
  */
@@ -135,7 +139,7 @@ uint16_t divider;
 uint8_t transmitting;
 int sw_adc;                    // request flag and result of ADC of the switches
 
-uint32_t bandstack[3] = { 28250000UL, 21100000UL, 7100000UL };     //10106000UL, 
+uint32_t bandstack[3] = { 21100000UL, 10106000UL, 7100000UL };
 
 #define I2STATS                // see if the i2c interrupts are functioning and being useful in freeing up cpu time
 #ifdef I2STATS
@@ -199,7 +203,8 @@ volatile uint8_t tx_ready_flag;
 #define MENU_U 1
 uint8_t encoder_user;
 int     step_ = 1000;
-uint8_t tx_inhibit = 1;        // start with a band switches check message before transmit
+uint8_t tx_inhibit = 1;        // start with a band switches check message before transmit, sets power out at minimum possible
+uint8_t tune_pwr;              // low power mode, double tap encoder to toggle
 uint8_t s_tone;                // sidetone independant of actual transmit condition
 volatile int     break_in;     // semi break in counter
 volatile int8_t  waveshape;    // cw wave shaping from sine cosine table
@@ -219,6 +224,8 @@ const char msg2[] PROGMEM = "RIT Enabled";
 const char msg3[] PROGMEM = "SDX TriBander";
 const char msg4[] PROGMEM = "K1URC wb2cba pe1nnz";
 const char msg5[] PROGMEM = "EEPROM ? Check vars";
+const char msg6[] PROGMEM = "Tune Power Level";
+const char msg7[] PROGMEM = "Full Power Enabled";
 
 int16_t  agc;                          // made variable global for the s meter
 uint8_t bits = 6;                      // agc bits == number of bits shifted out of the CIC filter process
@@ -450,7 +457,9 @@ void enc_button(){
   if( sw_state[2] < TAP ) return;
 
     switch( sw_state[2] ){
-        case DTAP:  freq = 3928000; qsy(0); si5351.SendRegister(177, 0xA0);  break; //!!! unused function available
+        case DTAP:  freq = 3928000; qsy(0); si5351.SendRegister(177, 0xA0);    // !!! temp qsy to 80 meters
+           tune_pwr ^= 1;   pwr_message();
+        break;
         case TAP:  step_ = ( step_ == 100 ) ? 1000 : 100;  break;    // toggle tuning step size
         case LONGPRESS:                                              // quick entry to edit volume
            strip_menu(0); strip_menu(1); strip_menu(1);
@@ -484,6 +493,11 @@ char b;
    return ( (dir == 2 ) ? 1: -1 );   /* swap defines ENC_A, ENC_B if it works backwards */
 }
 
+void pwr_message(){
+
+  if( tune_pwr ) p_msg( msg6,6 );
+  else p_msg( msg7,6 );
+}
 
 void qsy( int8_t f ){
 int st;
@@ -497,8 +511,17 @@ int st;
    if( mode == USB ) si5351.freq( freq, 0, 90, divider );
    else si5351.freq( freq, 90, 0, divider );
    display_freq();
-      // !!! do offsets for cw and AM, 600hz, 1k hz
-   
+      // offsets for cw and AM, 600hz, 1k hz
+   if( rit_enabled == 0 ){   
+      if( mode == CW ){
+        si5351.freq_calc_fast( -600 );
+        si5351.SendPLLBRegisterBulk();   
+      }
+      if( mode == AM ){                    // AM is tuned 1k high off freq
+        si5351.freq_calc_fast( -1000 );
+        si5351.SendPLLBRegisterBulk();   
+      }
+   }
 }
 
 void calc_divider(){
@@ -516,19 +539,26 @@ uint32_t  f;
 
 void display_freq(){
 int rem;
+uint32_t f;
+static uint8_t msg_displayed;                      // write the RIT message only once
 
-   rem = freq % 1000;
+   if( rit_enabled == 0 ) msg_displayed = 0;
+   f = freq;
+   if( mode == CW ) f -= 600;
+   if( mode == AM ) f -= 1000;
+   
+   rem = f % 1000;
 
     // display big numbers in the blue area of the screen
     // font widths/height are: small 6 x 8, Medium 12 x 16, Big 14 x 24
     LCD.setFont(BigNumbers);
-    LCD.printNumI(freq/1000,12,ROW2,5,'/');
+    LCD.printNumI(f/1000,12,ROW2,5,'/');
     LCD.setFont(MediumNumbers);
     LCD.printNumI(rem,5*14 + 12 + 3,ROW3,3,'0');
-    LCD.setFont( SmallFont );                     // keep OLED in small text as the default font
-    if( rit_enabled ) p_msg( msg2, 6 );           // RIT message
+    LCD.setFont( SmallFont );                                                        // keep OLED in small text as the default font
+    if( rit_enabled && msg_displayed == 0 ) p_msg( msg2, 6 ), msg_displayed = 1;     // RIT message
     LCD.gotoRowCol( 3,0 );
-    LCD.putch( band_priv(freq));
+    LCD.putch( band_priv(f));
  
 }
 
@@ -851,90 +881,6 @@ static uint8_t first_read;
    else return state;
 }
 
-
-/****************************  
-uint8_t i2poll(){    
-static  uint8_t state = 0;
-static unsigned int data;
-static unsigned int read_qty;
-static uint8_t first_read;
-
-   
-   switch( state ){
-     
-      case 0:      // idle state or between characters
-        if( i2in != i2out ){   // get next character
-           data = i2buf[i2out++];
-           i2out &= (I2TBUFSIZE - 1 );
-         
-           if( data & ISTART ){   // start
-              if( data & 1 ) read_qty = data >> 10;     // read queued
-              data &= 0xff;
-              // set start condition
-              TWCR = (1<<TWINT) | (1<<TWSTA) | (1<<TWEN) | (I2INT_ENABLED); 
-              state = 1; 
-           }
-           else if( data & ISTOP ){  // stop
-              // set stop condition
-              TWCR = (1<<TWINT) | (1<<TWEN) | (1<<TWSTO) | (I2INT_ENABLED);
-              state = 3;
-           }
-           else{   // just data to send
-              TWDR = data;
-              TWCR = (1<<TWINT) | (1<<TWEN) | (I2INT_ENABLED);
-              state = 2;
-           }
-        }
-        else TWCR = (1<<TWEN);      // stop interrupts, keep enabled
-      // break;                     // no break, check for stop completion
-      case 3:  // wait here for stop to clear. TWINT does not return to high and no interrupts happen on stop.
-         if( state != 3 ) break;
-         while( 1 ){
-            if( (TWCR & (1<<TWSTO)) == 0 ){
-               state = 0;
-               i2done = 1;           // i2c transaction complete, buffer is free for next one
-               break;
-            }
-         }
-      break;
-      
-      case 1:  // test for start to clear, send saved data which has the device address
-         if( (TWCR & (1<<TWINT)) ){
-            state = ( data & 1 ) ? 4 : 2;    // read or write pending?
-            first_read = 1;
-            TWDR = data;
-            TWCR = (1<<TWINT) | (1<<TWEN) | (I2INT_ENABLED);
-         }
-      break;
-      case 2:  // test for done
-         if( (TWCR & (1<<TWINT)) ){  
-            state = 0;
-         }
-      break;
-      case 4:  // non blocking read until count has expired
-         if( (TWCR & (1<<TWINT)) ){
-            // read data
-            if( first_read ) first_read = 0;       // discard the 1st read, need 8 more clocks for real data
-            else{
-               i2rbuf[i2rin++] = TWDR;
-               i2rin &= ( I2RBUFSIZE - 1 );
-               if( --read_qty == 0 ) state = 0;    // done
-            }
-            
-            if( read_qty ){                        // any left ?
-               if( read_qty > 1 ) TWCR = (1<<TWINT) | (1<<TWEN) | (1<<TWEA) | (I2INT_ENABLED);  // not the last read
-               else TWCR = (1<<TWINT) | (1<<TWEN) | (I2INT_ENABLED);                            // nack the last read
-            }
-         }
-      break;    
-   }
-   
-   gi2state = state;
-   if( i2in != i2out ) return (state + 8);
-   else return state;
-}
-***********************************/
-
 /*********** end I2C functions  ************/
 
 
@@ -944,7 +890,7 @@ static uint8_t first_read;
                          // pad with spaces out to multiple of 4 fields
 const char smenu[] PROGMEM = "Vol AttnBandModeKSpdKmdeSvolBdlyCal PminPmaxVox ToneAGC Filt    ";
 uint8_t *svar[NUM_MENU] = {&volume,&attn,&band,&mode,&kspeed,&kmode,&side_vol,&bdelay,&cal,&Pmin,&Pmax,&vox,&a_alpha,&agc_on,&filter};
-uint8_t  smax[NUM_MENU] = {  63,   3,    2,     3,     25,    7,     63,       100,   254,   20,   63,  1,   20,      1,        2 };
+uint8_t  smax[NUM_MENU] = {  63,   3,    2,     3,     25,    7,     63,       100,   254,   10,   63,  1,   20,      1,        2 };
 uint32_t stripee = 0b00000000000000000000011110100000;           // set corresponding bit for strip menu items to save in eeprom
 
 // note: a smax value of 255 will not be restored from eeprom, it looks like erased data.
@@ -1254,8 +1200,6 @@ int8_t pdl;
 
 
 void tx(){                // change to transmit
-
-    if( tx_inhibit ) return;
     
     digitalWrite( RX_EN, LOW );                 // mute
     digitalWrite(RELAY,HIGH );                  // solid state relay for external amp
@@ -1263,7 +1207,8 @@ void tx(){                // change to transmit
     else set_timer1( TXMOD );
     set_timer2( TX );
     si5351.SendRegister(3, 0b11111011 );
-    transmitting = 1;  
+    transmitting = 1;
+    rit_enabled = 1;                            // auto RIT feature, cancel with exit button  
 }
 
 void rx(){                // change to receive
@@ -1290,7 +1235,7 @@ void set_timer1( uint8_t clk ){                // timer 1 is set for 8 bit fixed
       // OCR1AL controls audio,  OCR1BL controls transmit pwm.
    PRR &= ~(1 << PRTIM1 );
    OCR1AH = 0;                               // the temp high byte register is saved for these next low byte writes
-   OCR1AL = 128;  OCR1BL = 0;  TCNT1L = 0;   // or should OCR1BL = Pmin ?
+   OCR1AL = 128;  OCR1BL = 0;  TCNT1L = 0;
    TCCR1A = clk | 1;
    TCCR1B = 0b00001001;
   // pinMode( AUDIO_PIN, OUTPUT );
@@ -1343,7 +1288,8 @@ int inv;
       power = pgm_read_byte( &sin_cos[waveshape] ) << 2;       // 0 - 256
       power *= Pmax;
       power >>= 6;
-      OCR1BL = constrain(power + Pmin,0,255);
+      if( tune_pwr ) power >>= 1;
+      if( tx_inhibit == 0 ) OCR1BL = constrain(power + Pmin,0,255);
       ++waveshape;
       break_in = 0;
    }
@@ -1352,12 +1298,13 @@ int inv;
       power = pgm_read_byte( &sin_cos[inv] ) << 2;
       power *= Pmax;
       power >>= 6;
+      if( tune_pwr ) power >>= 1;
       if( ++waveshape == 0 ){
         OCR1BL = 0;
         si5351.SendRegister(3, 0b11111111);    // tx clock off
         break_in = 10 * (int)bdelay + 1;      
       }
-      else OCR1BL = constrain(power + Pmin,0,255);
+      else if( tx_inhibit == 0 ) OCR1BL = constrain(power + Pmin,0,255);
    }
   
 }
@@ -1451,20 +1398,24 @@ static int txin, txout;
        #endif  
 
        if( tx_ready_flag ){    
-          OCR1BL = Mag[txout];                         // write mag here for 1 sample delay ?
-          si5351.freq_calc_fast(Phase[txout++]);
+          OCR1BL = Mag[txout];
+          if( mode != AM ){
+             si5351.freq_calc_fast(Phase[txout]);                     // could this be done in process2 ?
+                                                                      // NO, it needs to be in the pipeline to correct sync
+             if( i2done )  si5351.SendPLLBRegisterBulk(); 
+             else{                                                          // skip and count error, clear buffer
+                //uint32_t tm = micros();
+                while( i2done == 0 ) i2poll();                             // clear i2 buffer, in interrupt no noInterrupts needed
+                //if( micros() - tm  < 10 ) si5351.SendPLLBRegisterBulk();   // just a little late, maybe the next one will catch up
+                #ifdef I2STATS
+                  //else ++tx_i2late;                      // did not send phase update to si5351, same freq as last time
+                  ++tx_i2late;
+                #endif  
+             }
+          }
+          ++txout;
           txout &= TXPIPE-1;
           --tx_ready_flag;
-          
-          if( i2done )  si5351.SendPLLBRegisterBulk(); 
-          else{                                                          // skip and count error, clear buffer
-              uint32_t tm = micros();
-              while( i2done == 0 ) i2poll();                             // clear i2 buffer, in interrupt no noInterrupts needed
-              if( micros() - tm  < 10 ) si5351.SendPLLBRegisterBulk();   // just a little late, maybe the next one will catch up
-              #ifdef I2STATS
-                else ++tx_i2late;                      // did not send phase update to si5351, same freq as last time
-              #endif  
-          }
        }
        #ifdef I2STATS
          else ++tx_underruns;                    // nothing ready to send
@@ -1486,23 +1437,31 @@ static uint8_t tx_in, tx_out;
        tx_in &= TXPIPE-1;
        --tx_process_flag;
        interrupts();
+                                                         // !!! add some compression and gain here
+                                                         // want max signal +-128 or +-512, 8 bits or 10 bits
 
-       tx_hilbert( y2 );                     // get valq and vali
+       if( mode == AM ) mag = ccAM(y2), dp = -1000;      // controlled carrier AM
+       
+       else{ 
+          tx_hilbert( y2 );                              // get valq and vali
+          mag = fastAM( vali, valq ) >> 2;               // to 8 bits  !!! possible gain here, make AM and SSB the same bits
+          mag *= Pmax;                                   // slope, Pmax is 0 to 63 to stay in 16 bits
+          mag >>= 6;
+       // mag += Pmin;                                   // y intercept
+          mag = constrain( mag + Pmin, 0, 255 );         // clip to 8 bits 
+          phase  = arctan3( valq, vali );
+          dp = phase - prev_phase;                       // delta phase
+          prev_phase = phase;
+          if( dp < -_UA/2 ) dp += _UA;
+          if( mode == LSB ) dp = -dp;
+          dp = constrain(dp,-3000,3000);
+       }   
 
-       mag = fastAM( vali, valq ) >> 2;      // to 8 bits
-       mag *= Pmax;                          // slope, Pmax is 0 to 63 to stay in 16 bits
-       mag >>= 6;
-       // mag += Pmin;                          // y intercept
-       mag = constrain( mag + Pmin, 0, 255 );   // clip to 8 bits
+       if( tx_inhibit ) mag = 0;
+       if( tune_pwr ) mag >>= 1;
 
-       phase  = arctan3( valq, vali );
-
-       dp = phase - prev_phase;              // delta phase
-       prev_phase = phase;
-       if( dp < -_UA/2 ) dp += _UA;
-       if( mode == LSB ) dp = -dp;
-       dp = constrain(dp,-3000,3000);
-
+       // !!! delay line for mag or dp here for best sync
+       
        if( tx_ready_flag < TXPIPE -1 ){
           noInterrupts();
           Phase[tx_out] = dp;
@@ -1514,7 +1473,29 @@ static uint8_t tx_in, tx_out;
   
 }
 
-int16_t fastAM( int16_t i, int16_t q ){           // estimation of sqrt( i^2 + q^2 )
+int16_t ccAM( int16_t mag ){             // controlled carrier AM
+static int16_t carrier;
+static uint8_t mod;
+int16_t mx;
+
+   mx = 255*Pmax;                       // max desired peak signal !!! could be moved to post strip menu calculations
+   mx >>= 6;                            // and out of critical timing loop
+   mx += Pmin;
+   mx >>= 1;                            // peak carrier level 1/2 of peak signal
+   
+   mag *= Pmax;
+   mag >>= 6;                           // !!! or add some gain here? or remove 2 extra bits if at 10 bit
+   if( (mag + carrier) < Pmin ) carrier = abs( mag ) + Pmin + 10;
+   ++mod;
+   mod &= 15;
+   if( mod == 0 ) --carrier;
+   carrier = constrain( carrier, Pmin, mx);            // max carrier should be 1/2 of max signal
+   mag = constrain((mag+carrier),0, 255 );             // clip to 8 bits
+   
+   return mag;
+}
+
+inline int16_t fastAM( int16_t i, int16_t q ){           // estimation of sqrt( i^2 + q^2 )
 
   
     // quicker version   max + min/4
