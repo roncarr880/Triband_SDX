@@ -9,7 +9,7 @@
  *        In theory we will have more time to process more complicated receive algorithms.
  *     Able to use a library for the screen with some nice numeric fonts.
  * 
- * !!! Hardware mods.  The Si5351 module was NOT converted to run 3.3 volts I2C signals. 
+ *     Hardware mods.  The Si5351 module was NOT converted to run 3.3 volts I2C signals. 
  *     Jumpered pin 27 to 4 and 28 to 5 to get I2C signals to the OLED.
  *     On the display board I used jumpers in place of the diodes ( D1,D2 ) to run the OLED on 5 volts.
  *     
@@ -25,6 +25,8 @@
  *     The two pole filter should cut the 72khz PWM by 30 db.
  *     I also put a 22 ohm resistor across the audio out jack.  A higher volume setting when using
  *     a digital volume control means more bits are being used which should result in better fidelity.
+ *     
+ * More modulation bits.  Put a 10k resistor from TP1 to ground on the RF board.   
  *     
  * I put in 2.2nf caps in the op-amp feedback.  I also have 47k resistors in place of 82k as I hadn't any 82k resistors on hand.   
  * 
@@ -209,6 +211,7 @@ uint8_t s_tone;                // sidetone independant of actual transmit condit
 volatile int     break_in;     // semi break in counter
 volatile int8_t  waveshape;    // cw wave shaping from sine cosine table
 uint8_t menu_on = 1;           // screen sharing flag
+int16_t maxAM;                 // AM mode carrier level
 
 // CIC filter compensation     FIR filter of length 3 with constants  -alpha/2,  alpha+1, -alpha/2
 uint8_t a_alpha = 5;
@@ -255,7 +258,7 @@ void setup() {
   pinMode(ENC_B, INPUT_PULLUP);
   pinMode(SW_ADC, INPUT);
   pinMode(TXMOD_PIN, OUTPUT );
-  digitalWrite(TXMOD_PIN, LOW );           // ? vaguely remember something about leaving this high for better cw shaping
+  digitalWrite(TXMOD_PIN, LOW );
   pinMode( AUDIO_PIN, OUTPUT );
   digitalWrite( AUDIO_PIN, LOW );          // if thumps try the floating the pin as in timer1 startup notes
   pinMode( RX_EN, OUTPUT );
@@ -265,6 +268,7 @@ void setup() {
   digitalWrite(RELAY,LOW);                 // the external amp relay
 
   i2init();
+  si5351.powerDown();
   LCD.InitLCD();
   LCD.clrScr();
   LCD.setFont(SmallFont);
@@ -277,6 +281,8 @@ void setup() {
   p_msg( msg3,0 );                         // sign on messages
   p_msg( msg4,1 );
   p_msg( msg1,6 );                         // display band switch check message, manual switches for Tribander
+
+  calc_maxAM();                            // AM mode carrier
   
   analogRead( SW_ADC );                    // enable the ADC the easy way?
   // PRR &= ~( 1 << PRADC );               // adc power reduction bit should be clear
@@ -285,6 +291,8 @@ void setup() {
   set_timer2( RX );                        // start receiver
   digitalWrite( RX_EN, HIGH );             // antenna switch
 
+  si5351.SendRegister(24, 0b00010000);     // this was the proposed fix for the CW waveform glitch
+                                           // leaves clock2 output high when disabled
 
 }
 
@@ -684,20 +692,29 @@ uint8_t t;
   i2send( dat );
   // change baud rate here for si5351 vs OLED ?  17 or 6
   // may be better to just use the transmitting variable or both
-  // lets try it.  And find using 125k does free up processing time for the receiver, less interrupt overhead probably
+  // And we find using 125k does free up processing time for the receiver, less interrupt overhead probably
   //TWBR = ( adr == 0x60 ) ? 4 : 72;  // oled lower priority, we shouldn't write oled while transmitting
-   TWBR = ( transmitting ) ? 3 : 72;  // oled lower priority, we shouldn't be writing the oled while transmitting
+  // TWBR = ( transmitting ) ? 4 : 72;  // oled lower priority, we shouldn't be writing the oled while transmitting
+  if( transmitting && TWBR == 72 ){
+      delayMicroseconds(12);            // wait one baud for stop to clear on the bus 
+      TWBR = 4;
+  }
+  if( transmitting == 0 && TWBR != 72 ){
+      delayMicroseconds( 12 );
+      TWBR = 72;
+  }
   
 }
 
 void my_delay( uint32_t val ){                  // delay micros with yield type of feature
 uint32_t tm;
 
-    if( transmitting ) return;                  // rx process not running
-    val *= 4;                                   // for 125k baud delay
+    if( transmitting ) return;                  // rx process not running, can't wait for tx, just drop the packet
+    //if( transmitting == 0 ) val *= 4;             // for 125k baud delay
     tm = micros();
     while( micros() - tm < val ){
         if( rx_process_flag ) rx_process2();    // run receive processing while waiting on the I2C bus
+        //if( tx_process_flag ) tx_process2();
     }
 
 }
@@ -842,15 +859,15 @@ static uint8_t first_read;
            if( data & ISTART ){   // start
               if( data & 1 ) read_qty = data >> 10;     // read queued
               data &= 0xff;
-              while(TWCR & (1<<TWSTO));                                      // wait for previous stop to clear
+           //   while(TWCR & (1<<TWSTO));                                      // wait for previous stop to clear
               TWCR = (1<<TWINT) | (1<<TWSTA) | (1<<TWEN) | (I2INT_ENABLED);  // set start condition
               state = 1; 
            }
            else if( data & ISTOP ){  // stop
               // set stop condition
               TWCR = (1<<TWINT) | (1<<TWEN) | (1<<TWSTO) | (I2INT_ENABLED);
-              //state = 3;
-              i2done = 1;
+              state = 3;
+              //i2done = 1;
            }
            else{   // just data to send
               TWDR = data;
@@ -862,8 +879,8 @@ static uint8_t first_read;
       // break;                     // no break, check for stop completion
    }
 
-  /******
-   if( state == 3 ){     merged this processing into state 0, may not need to wait for stop
+ 
+   if( state == 3 ){     // was once,  merged this processing into state 0, may not need to wait for stop
       //case 3:  // wait here for stop to clear. TWINT does not return to high and no interrupts happen on stop.
       //   if( state != 3 ) break;
          while( 1 ){
@@ -875,7 +892,6 @@ static uint8_t first_read;
          }
       //break;
    }
-   ********/
    
    if( i2in != i2out ) return (state + 8);
    else return state;
@@ -1018,6 +1034,7 @@ int i;
          load_filter();
          break;
       case 8:  qsy(0);  break;                     // calibrate, implement freq change for user observation
+      case 9: case 10:  calc_maxAM();   break;
       case 12:  calc_CIC();  break;                // Tone control is the CIC compensation filter parameters
       case 13:  bits = 8;  break;                  // agc off or on, set agc compression to max
       case 14: load_filter(); break;
@@ -1055,6 +1072,16 @@ uint8_t val;
       }
    }
 }
+
+
+void calc_maxAM(){                      // calc max AM mode carrier level
+  
+   maxAM = 255*Pmax;
+   maxAM >>= 6;
+   maxAM += Pmin;
+   maxAM >>= 1;                         // peak carrier level 1/2 of peak signal
+}
+
 
 void calc_CIC(){                      // calculate the constants for the CIC compensation filter.  In Q6 format.
 float a;
@@ -1200,25 +1227,31 @@ int8_t pdl;
 
 
 void tx(){                // change to transmit
+
+    set_timer2( 0 );
     
     digitalWrite( RX_EN, LOW );                 // mute
     digitalWrite(RELAY,HIGH );                  // solid state relay for external amp
     if( mode == CW ) set_timer1( TXMOD+AUDIO );
     else set_timer1( TXMOD );
-    set_timer2( TX );
-    si5351.SendRegister(3, 0b11111011 );
+    // set_timer2( TX );
     transmitting = 1;
-    rit_enabled = 1;                            // auto RIT feature, cancel with exit button  
+    si5351.SendRegister(3, 0b11111011 );
+    rit_enabled = 1;                            // auto RIT feature, cancel with exit button
+
+    set_timer2( TX );
 }
 
 void rx(){                // change to receive
 
+    set_timer2( 0 );
     set_timer1( AUDIO );
-    set_timer2( RX ); 
-    transmitting = 0;
+    // set_timer2( RX ); 
     si5351.SendRegister(3, 0b11111100);
+    transmitting = 0;
     digitalWrite(RELAY,LOW);
     digitalWrite( RX_EN, ( attn & 2 ) ? LOW : HIGH );
+    set_timer2( RX );
 }
 
 void set_timer1( uint8_t clk ){                // timer 1 is set for 8 bit fixed mode 78k PWM
@@ -1252,14 +1285,19 @@ void set_timer2( int8_t timer_mode){
   TCCR2A = 2;                        // CTC mode
   TIMSK2 = timer_mode;               // enable interrupts A match or B match, RX TX defines
                                      // OCR2A = (F_CPU / pre-scaler / fs) - 1;
-                                           // actual fs = f_fcu / ( N * (1 + OCR2A ))
+                                     // actual fs = f_fcu / ( N * (1 + OCR2A ))
+  
   if( timer_mode == RX ){
      if( mode == CW ) OCR2A = 62;          // 40000, actual is 39682, slower for cw as out of cpu
      else OCR2A = 51;                      // count to value, resets, interrupts, fs = 48077:51  54347:45
   }
-  if( timer_mode == TX ) OCR2A = 222;      // fs = 11210 int rate,  5605 tx update rate, if change here then change _UA
-  OCR2B = OCR2A - 1;                       // use the 2nd interrupt for transmit
-  TCCR2B = 2;                              // start clocks, divide by 8 clock prescale
+  //if( timer_mode == TX ) OCR2A = 222;      // fs = 11210 int rate,  5605 tx update rate, if change here then change _UA
+  if( timer_mode == TX ) OCR2A = 230;      // fs = 10822            5411 tx update rate
+
+  if( timer_mode != 0 ){
+    OCR2B = OCR2A - 1;                       // use the 2nd interrupt for transmit
+    TCCR2B = 2;                              // start clocks, divide by 8 clock prescale
+  }
   interrupts();
 }
 
@@ -1356,7 +1394,7 @@ static int16_t w[19];
 uint8_t i;
 int16_t t;
 
-    for( int i = 0; i < 18; ++i )  w[i] = w[i+1];
+    for( i = 0; i < 18; ++i )  w[i] = w[i+1];
     w[18] = val;
     valq = w[9];
 
@@ -1367,7 +1405,7 @@ int16_t t;
 }
 
 #define TX_REF (0x40 | 0x80)                 // 1.1 volt reference
-#define _UA   5605                           // make same as sample rate
+#define _UA   5411                           // make same as sample rate
 
 void tx_process(){
 int cin;
@@ -1386,7 +1424,7 @@ static int txin, txout;
        if( R ) return;
        
        y2 = y1 - y1d;   y1d = y1;            // comb length 2
-       y2 >>= 2;
+       y2 >>= 4;                             // drop the 2 extra CIC bits and go from 10 bits to 8 bits
 
        if( tx_process_flag < TXPIPE-1 ){
           TVal[txin++] = y2;
@@ -1401,11 +1439,12 @@ static int txin, txout;
           OCR1BL = Mag[txout];
           if( mode != AM ){
              si5351.freq_calc_fast(Phase[txout]);                     // could this be done in process2 ?
-                                                                      // NO, it needs to be in the pipeline to correct sync
+                                                                      // NO, it needs to be in the pipeline for correct sync
              if( i2done )  si5351.SendPLLBRegisterBulk(); 
              else{                                                          // skip and count error, clear buffer
                 //uint32_t tm = micros();
-                while( i2done == 0 ) i2poll();                             // clear i2 buffer, in interrupt no noInterrupts needed
+                //while( i2done == 0 ) i2poll();                             // clear i2 buffer, in interrupt no noInterrupts needed
+                polling = 1;                                                 // hang above ststement on tx?
                 //if( micros() - tm  < 10 ) si5351.SendPLLBRegisterBulk();   // just a little late, maybe the next one will catch up
                 #ifdef I2STATS
                   //else ++tx_i2late;                      // did not send phase update to si5351, same freq as last time
@@ -1431,25 +1470,37 @@ static int prev_phase;
 int dp, phase;
 int y2;
 static uint8_t tx_in, tx_out;
+static int16_t comp;
+static uint8_t mod;
+static int16_t a,b,c;        // delay line mag to phase adjustment
+
 
        noInterrupts();
        y2 = TVal[tx_in++];
        tx_in &= TXPIPE-1;
        --tx_process_flag;
        interrupts();
-                                                         // !!! add some compression and gain here
-                                                         // want max signal +-128 or +-512, 8 bits or 10 bits
+
+       // microphone compression or gain.  with 250/32 have almost 18db of mic gain possible
+       y2 *= comp;                                       // mult by compression/gain factor
+       y2 >>= 5;                                         // divide by 32
+       if( abs( y2 ) > 96 ) --comp;                      // fast attack, aim for max signal into following processes
+       if( ++mod == 0 ){                                 // slow decay                                 
+          if( comp < 250 ) ++comp;                       // !!! could make 250 a variable in the menu, mike gain
+       }
+
+       y2 = CIC_comp( y2 );                              // CIC compensation filter, adds more high tones
 
        if( mode == AM ) mag = ccAM(y2), dp = -1000;      // controlled carrier AM
        
-       else{ 
+       else{                                             // SSB
           tx_hilbert( y2 );                              // get valq and vali
-          mag = fastAM( vali, valq ) >> 2;               // to 8 bits  !!! possible gain here, make AM and SSB the same bits
+          mag = fastAM( vali, valq );
           mag *= Pmax;                                   // slope, Pmax is 0 to 63 to stay in 16 bits
           mag >>= 6;
        // mag += Pmin;                                   // y intercept
           mag = constrain( mag + Pmin, 0, 255 );         // clip to 8 bits 
-          phase  = arctan3( valq, vali );
+          phase  = arctan3( vali, valq );                // !!! swapped I and Q from T3.2 version
           dp = phase - prev_phase;                       // delta phase
           prev_phase = phase;
           if( dp < -_UA/2 ) dp += _UA;
@@ -1460,7 +1511,12 @@ static uint8_t tx_in, tx_out;
        if( tx_inhibit ) mag = 0;
        if( tune_pwr ) mag >>= 1;
 
-       // !!! delay line for mag or dp here for best sync
+       // delay line for mag (or phase ) for best sync of phase and magnitude
+       c = mag;
+       mag = b;                     // 1 sample delay
+       //mag = a;                   // 2 sample delay
+       //a = b;
+       b = c;
        
        if( tx_ready_flag < TXPIPE -1 ){
           noInterrupts();
@@ -1477,19 +1533,14 @@ int16_t ccAM( int16_t mag ){             // controlled carrier AM
 static int16_t carrier;
 static uint8_t mod;
 int16_t mx;
-
-   mx = 255*Pmax;                       // max desired peak signal !!! could be moved to post strip menu calculations
-   mx >>= 6;                            // and out of critical timing loop
-   mx += Pmin;
-   mx >>= 1;                            // peak carrier level 1/2 of peak signal
    
    mag *= Pmax;
-   mag >>= 6;                           // !!! or add some gain here? or remove 2 extra bits if at 10 bit
+   mag >>= 6;
    if( (mag + carrier) < Pmin ) carrier = abs( mag ) + Pmin + 10;
    ++mod;
-   mod &= 15;
+   mod &= 63;
    if( mod == 0 ) --carrier;
-   carrier = constrain( carrier, Pmin, mx);            // max carrier should be 1/2 of max signal
+   carrier = constrain( carrier, Pmin, maxAM);         // max carrier should be 1/2 of max signal
    mag = constrain((mag+carrier),0, 255 );             // clip to 8 bits
    
    return mag;
@@ -2144,7 +2195,10 @@ static uint8_t row = 6, col = 0;
 #ifdef I2STATS
  void print_i2stats(){
   
-           if( transmitting ) return;
+           //if( transmitting ) return;
+           // can we write debug info to the OLED in cw mode transmit without any issues? 
+           if( mode != CW && transmitting ) return;
+           
            uint16_t a,b,c,d,e,f,g,h,i,j;
            noInterrupts();
            a = i2ints;  b = i2polls;  c = i2stalls;
@@ -2163,16 +2217,16 @@ static uint8_t row = 6, col = 0;
           // LCD.printNumI( b, CENTER, ROW7 );     // some OLED functions may overfill our buffer, polling counts here
           // LCD.printNumI( c, RIGHT, ROW7 );      // polling may cause int flags out of sync with i2state, counts here
           
-          LCD.printNumI( d, LEFT, ROW7 );          // rx_process overruns
+          //LCD.printNumI( d, LEFT, ROW7 );          // rx_process overruns
           //LCD.printNumI(ADCSRA & 7 , CENTER, ROW7 );    // check auto ADC baud rate value
-          LCD.printNumI( f, CENTER, ROW7 );        // pipeline delay
-          LCD.printNumI( e, RIGHT, ROW7 );         // rx underruns
+          //LCD.printNumI( f, CENTER, ROW7 );        // pipeline delay
+          //LCD.printNumI( e, RIGHT, ROW7 );         // rx underruns
 
           
-          //LCD.printNumI( j, RIGHT, ROW6 );         // tx i2c late
-          //LCD.printNumI( g, CENTER, ROW7 );        // tx pipeline
-          //LCD.printNumI( h, RIGHT, ROW7 );         // tx underruns
-          //LCD.printNumI( i, LEFT, ROW7 );          // tx overruns  
+          LCD.printNumI( j, RIGHT, ROW6 );         // tx i2c late
+          LCD.printNumI( g, CENTER, ROW7 );        // tx pipeline
+          LCD.printNumI( h, RIGHT, ROW7 );         // tx underruns
+          LCD.printNumI( i, LEFT, ROW7 );          // tx overruns  
  }
 #endif
 
