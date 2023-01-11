@@ -177,6 +177,18 @@ public:
 //  }
 //  #define SI_CLK_OE 3 
 
+  void powerDown(){
+    SendRegister(3, 0b11111111); // Disable all CLK outputs
+    SendRegister(24, 0b00000000); // Disable state: LOW state when disabled
+    SendRegister(25, 0b00000000); // Disable state: LOW state when disabled
+    for(int addr = 16; addr != 24; addr++) SendRegister(addr, 0b10000000);  // Conserve power when output is disabled
+    SendRegister(187, 0);        // Disable fanout (power-safe)
+    // To initialise things as they should:
+    SendRegister(149, 0);        // Disable spread spectrum enable
+    SendRegister(183, 0b11010010);  // Internal CL = 10 pF (default)
+  }
+
+
 };
 
 // static SI5351 si5351;

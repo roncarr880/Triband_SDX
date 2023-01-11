@@ -250,6 +250,7 @@ const int8_t filters[7][10] PROGMEM = {
 int8_t  kf[10] = {  64, 0, 0, 0, 0, 64, 0, 0, 0, 0 };    // default as passthrough
 int16_t wi[6], wo[6];                                    // delay terms for the IIR filter
 uint8_t filter;                                          // chosen filter,  menu item
+volatile uint8_t from_int;                               // i2 functions called from interrupt context and non-interrupt
 
 
 void setup() {
@@ -510,6 +511,7 @@ void pwr_message(){
 void qsy( int8_t f ){
 int st;
 
+   if( transmitting ) return;
    st = step_;                            // different step depending upon mode
    if( mode == CW ) st = st >> 1;
    if( rit_enabled ) st = 10;
@@ -550,6 +552,7 @@ int rem;
 uint32_t f;
 static uint8_t msg_displayed;                      // write the RIT message only once
 
+   if( transmitting ) return;
    if( rit_enabled == 0 ) msg_displayed = 0;
    f = freq;
    if( mode == CW ) f -= 600;
@@ -754,7 +757,8 @@ void i2stop( ){
    i2done = 0;
    noInterrupts();    // kick off sending this buffer
    i2poll();
-   interrupts();
+   if( from_int == 0 ) interrupts(); // called from interrupt processing sendPLLRegisterBulk, interrupts enabled early in that case.
+                                     // unless add this volatile variable to flag where the call to i2stop came from 
 }
 
 
@@ -921,6 +925,7 @@ static uint8_t ed;
 static uint8_t mode;   // 0 not active, 1 select var, 2 edit var
 static uint8_t hyper;
 
+   if( transmitting ) return;
    if( command == 3 && mode == 0 ){         // exit when not needed, clear out some latched on functions
       LCD.clrRow(6);
       tx_inhibit = 0;                                 // enable transmit
@@ -1440,6 +1445,7 @@ static int txin, txout;
           if( mode != AM ){
              si5351.freq_calc_fast(Phase[txout]);                     // could this be done in process2 ?
                                                                       // NO, it needs to be in the pipeline for correct sync
+             from_int = 1;
              if( i2done )  si5351.SendPLLBRegisterBulk(); 
              else{                                                          // skip and count error, clear buffer
                 //uint32_t tm = micros();
@@ -1451,6 +1457,7 @@ static int txin, txout;
                   ++tx_i2late;
                 #endif  
              }
+             from_int = 0;
           }
           ++txout;
           txout &= TXPIPE-1;
@@ -1869,6 +1876,8 @@ int8_t b,i,k;
 
   // LCD.printNumI( dbval, CENTER, ROW6, 5, ' ' );   // debug
 
+   if( transmitting ) return;
+   
       if( menu_on ){
         bars = 0;
         return;                   // screen area used by the menu
@@ -2195,9 +2204,9 @@ static uint8_t row = 6, col = 0;
 #ifdef I2STATS
  void print_i2stats(){
   
-           //if( transmitting ) return;
+           if( transmitting ) return;
            // can we write debug info to the OLED in cw mode transmit without any issues? 
-           if( mode != CW && transmitting ) return;
+           // if( mode != CW && transmitting ) return;
            
            uint16_t a,b,c,d,e,f,g,h,i,j;
            noInterrupts();
